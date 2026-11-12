@@ -10,6 +10,12 @@ animations have not been verified because no PS3 `.ani` files were available.
 
 ---
 
+## Supported Versions
+
+| Game                     |   PC   | Xbox 360 | PS3    |
+|--------------------------|:------:|:------:|:-------:|
+| Final Exam               |   ✅   |      |      |
+
 ## Quick Guide
 
 * **Install the entire `Zwo Exporter` folder** (the outer folder, which contains
@@ -29,12 +35,6 @@ animations have not been verified because no PS3 `.ani` files were available.
   individual files outside of it.
 
 ---
-
-## Supported Versions
-
-| Game                     |   PC   | Xbox 360 | PS3    |
-|--------------------------|:------:|:------:|:-------:|
-| Final Exam               |   ✅   |      |      |
 
 ## Features
 
