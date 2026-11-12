@@ -42,6 +42,30 @@ def asset_root_for(path):
     return os.path.dirname(os.path.abspath(path))
 
 
+def _find_sibling(path, extension):
+    """Find ``<stem><extension>`` next to ``path`` (case-insensitive).
+
+    Windows is normally case-insensitive, but asset rips and network shares can
+    carry upper-case extensions such as ``BASIC.GEO``.  Returning ``None``
+    lets the caller distinguish a missing file from a parse error.
+    """
+    base = os.path.splitext(path)[0]
+    direct = base + extension
+    if os.path.isfile(direct):
+        return direct
+    folder = os.path.dirname(os.path.abspath(path))
+    stem = os.path.splitext(os.path.basename(path))[0].lower()
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    for name in names:
+        name_stem, name_ext = os.path.splitext(name)
+        if name_stem.lower() == stem and name_ext.lower() == extension.lower():
+            return os.path.join(folder, name)
+    return None
+
+
 def _texture_dir():
     path = os.path.join(tempfile.gettempdir(), "zwo_exporter_textures")
     os.makedirs(path, exist_ok=True)
@@ -757,14 +781,34 @@ def import_asset(context, zwo_path, options=None):
     }
 
     base, _ext = os.path.splitext(zwo_path)
-    geo_path = base + ".geo"
+    geo_path = _find_sibling(zwo_path, ".geo")
     asset_root = asset_root_for(zwo_path)
 
     zwo = ZwoFile.load(zwo_path)
-    geo = GeoFile.load(geo_path) if os.path.isfile(geo_path) else None
+    geo = GeoFile.load(geo_path) if geo_path else None
     report["geo"] = geo
+    report["geo_path"] = geo_path
+    mesh_nodes = [node for node in zwo.walk() if node.tag in MESH_NODE_TAGS]
+    if geo is None and mesh_nodes:
+        hint = ""
+        folder = os.path.dirname(os.path.abspath(zwo_path))
+        try:
+            if not any(name.lower().endswith(".geo") for name in os.listdir(folder)):
+                hint = (" This folder has no .geo files at all, so it looks like only "
+                        "the .zwo scenes were extracted; re-extract the full game data "
+                        "(.geo/.hvt/.ani) or import from the complete data folder.")
+        except OSError:
+            pass
+        # Fail before creating anything so no orphan armature is left behind.
+        raise ValueError(
+            "no sibling .geo file found (expected %s.geo next to the .zwo).%s"
+            % (base, hint))
     if geo is None:
-        report["warnings"].append("no sibling .geo file")
+        report["warnings"].append(
+            "no sibling .geo file found (expected %s.geo next to the .zwo)" % base)
+    elif not geo.meshes:
+        report["warnings"].append(
+            "%s contains no meshes" % os.path.basename(geo_path))
 
     collection = bpy.data.collections.new(os.path.basename(base))
     context.scene.collection.children.link(collection)

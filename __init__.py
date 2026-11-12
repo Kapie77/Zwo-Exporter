@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Zwo Exporter (Final Exam)",
-    "author": "Zwo Exporter contributors",
-    "version": (0, 2, 0),
+    "author": "Kaplan",
+    "version": (0, 2, 1),
     "blender": (4, 2, 0),
     "location": "File > Import-Export > Final Exam ZWO",
     "description": "Import and export Final Exam (.zwo / .geo / .hvt / .ani) assets",
@@ -53,6 +53,14 @@ class ZWO_OT_import(bpy.types.Operator, ImportHelper):
             report = import_asset(context, path, options)
         except Exception as exc:                      # noqa: BLE001
             self.report({"ERROR"}, "Import failed: %s" % exc)
+            return {"CANCELLED"}
+        imported = report["meshes"] + report.get("cameras", 0) + report.get("lights", 0)
+        if imported == 0:
+            reason = "; ".join(report["warnings"]) or \
+                "the .zwo contains no mesh, light or camera nodes"
+            self.report({"ERROR"},
+                        "%s: nothing imported - %s"
+                        % (os.path.basename(path), reason))
             return {"CANCELLED"}
         self.report({"INFO"},
                     "%s: %d objects, %d vertices, %d faces, %d skinned"
@@ -217,6 +225,8 @@ class ZWO_PT_panel(bpy.types.Panel):
                           % (obj["zwo_mesh_index"], obj.get("zwo_mesh_stride")))
             if obj.get("zwo_bones"):
                 box.label(text="%d bones" % len(obj["zwo_bones"].split(";")))
+
+        layout.label(text="Zwo Exporter %s" % ".".join(str(v) for v in bl_info["version"]))
 
 
 def _active_armature(context):

@@ -10,6 +10,26 @@ animations have not been verified because no PS3 `.ani` files were available.
 
 ---
 
+## Guia rápido (PT-BR)
+
+* **Instale a pasta `Zwo Exporter` inteira** (a pasta de fora, que contém
+  `__init__.py` e `README.md`). Ao criar um ZIP para instalar, o ZIP precisa
+  conter a estrutura `Zwo Exporter\__init__.py` + `Zwo Exporter\zwo_exporter\`.
+  Zipe a pasta **main inteira**, nunca só a pasta interna `zwo_exporter` — ela é
+  apenas a camada de formato e não é um add-on.
+* **Importe o `.zwo` a partir da árvore de jogo extraída completa.** O `.geo`
+  (geometria) precisa estar **na mesma pasta, com o mesmo nome** do `.zwo`
+  (`basic.zwo` → `basic.geo`). Um `.zwo` copiado sozinho para outra pasta não
+  tem como gerar malhas.
+* Para **texturas**, o `.hvt` correspondente também precisa estar extraído.
+* Para **animações**, os arquivos `.ani` também precisam estar extraídos (ficam
+  normalmente em `...\anims\` ou `...\anims\all\`). Importe primeiro o `.zwo` do
+  personagem, selecione o armature e só então importe o `.ani`.
+* Mantenha a estrutura `data\common\...` e `data\maps\...` intacta; não mova
+  arquivos isolados para fora dela.
+
+---
+
 ## Supported Versions
 
 | Game                     |   PC   | Xbox 360 | PS3    |
@@ -39,15 +59,27 @@ animations have not been verified because no PS3 `.ani` files were available.
 
 ## Installation
 
-1. Copy the `Zwo Exporter` folder (the one containing this README and
-   `__init__.py`) into your Blender add-ons directory:
+1. Copy the **whole `Zwo Exporter` folder** (the outer folder containing this
+   README and `__init__.py`, NOT the inner `zwo_exporter` package) into your
+   Blender add-ons directory:
 
    ```
    %APPDATA%\Blender Foundation\Blender\4.2\scripts\addons\Zwo Exporter
    ```
 
-   or zip the folder and use **Edit → Preferences → Add-ons → Install…**.
-2. Enable **Zwo Exporter (Final Exam)** in the add-ons list.
+   or zip **the whole main folder** and use
+   **Edit → Preferences → Add-ons → Install…**. The ZIP must contain:
+
+   ```
+   Zwo Exporter\__init__.py
+   Zwo Exporter\README.md
+   Zwo Exporter\zwo_exporter\...
+   ```
+
+   Do **not** zip the inner `zwo_exporter` folder on its own: it has no
+   `bl_info`/`register()` and Blender will not recognize it as an add-on.
+2. Enable **Zwo Exporter (Final Exam)** in the add-ons list (newly installed
+   add-ons start disabled; this is normal).
 3. The operators appear under **File → Import/Export** and in the 3D Viewport
    sidebar (`N` panel → **ZWO** tab).
 
@@ -55,9 +87,19 @@ animations have not been verified because no PS3 `.ani` files were available.
 
 ### Import a scene
 
-**File → Import → Final Exam (.zwo)** and pick a `.zwo` file. The add-on looks
-for the sibling `.geo` and `.hvt` files next to it and below the asset root
-(the folder that contains `common` and `maps`).
+**File → Import → Final Exam (.zwo)** and pick a `.zwo` file **from the fully
+extracted game data tree** (keep the original `data\common\...` /
+`data\maps\...` structure). The add-on needs the sibling files next to the
+`.zwo`:
+
+* `basic.geo` – geometry (required for meshes);
+* `basic.hvt` – textures;
+* `basic.ani` or files under `...\anims\` – animations.
+
+Importing a `.zwo` that was copied alone into another folder cannot create
+meshes, because its `.geo` is missing. In that case the add-on now aborts with
+an explicit error naming the expected `.geo` path instead of leaving only an
+armature.
 
 Options:
 
@@ -67,9 +109,15 @@ Options:
 
 ### Import an animation
 
+Animations are separate `.ani` files; they must be extracted from the game as
+well (usually under the character's `...\anims\` or `...\anims\all\` folder).
+
 1. Import the character (or prop/camera) `.zwo` first.
 2. Select the imported armature (or the animated object for object-only clips).
-3. **File → Import → Final Exam (.ani)** and pick an `.ani`.
+3. **File → Import → Final Exam (.ani)** and pick an `.ani` file.
+
+Each `.ani` is a separate clip (walk, run, attack, ...); import as many as you
+need. Re-importing the same clip replaces the previous action on those IDs.
 
 Options:
 
@@ -151,6 +199,7 @@ Tested against the shipped PC data:
 Zwo Exporter/
 ├─ __init__.py            add-on entry point, operators, panel, menus
 ├─ README.md
+├─ LICENSE.txt
 └─ zwo_exporter/
    ├─ __init__.py         side-effect free re-exports (no bpy)
    ├─ binio.py            endian-aware Reader/Writer
@@ -172,7 +221,41 @@ with plain Python.
 * `.ani` track tags are matched in both spellings because the shipped files mix
   conventions.
 
+## Troubleshooting
+
+**Only an armature appears / “0 objects, 0 vertices, 0 faces, 0 skinned”**
+
+The `.geo` file was not found. The importer needs the `.geo` **next to** the
+`.zwo`, with the same base name (`basic.zwo` → `basic.geo`). This happens when
+only the `.zwo` is copied out of the extracted game tree. Import the file from
+its original folder (below `common`/`maps`) instead of a scratch copy. The
+add-on now aborts with the exact expected path and does not leave an orphan
+armature behind.
+
+**The add-on is listed but does nothing / cannot be enabled**
+
+Make sure you installed the folder that contains `__init__.py` and this README
+(`Zwo Exporter`), not the inner `zwo_exporter` package. When creating a ZIP,
+zip the **whole main folder** so the archive contains
+`Zwo Exporter\__init__.py` + `Zwo Exporter\zwo_exporter\`. The inner folder is
+only the format layer and has no `bl_info`, so Blender does not recognize it as
+an add-on.
+
+**Importing `.ani` does nothing / “no node matches this animation”**
+
+The animation targets the armature/objects of a previously imported `.zwo`, and
+the `.ani` files must have been extracted from the game too (typically under
+`...\anims\` or `...\anims\all\`). Import the asset first, select its armature
+(or animated object) and then import the `.ani`. Re-importing a clip replaces
+the action on those IDs. Animations are not embedded in the `.zwo`.
+
+**Textures are pink / untextured**
+
+Textures are read from the sibling `.hvt`. If it is missing, geometry still
+imports but materials stay untextured. Check the console for the exact texture
+warnings.
+
 ## License
 
-No license is bundled; treat the add-on as an unofficial community tool. Final
-Exam and its assets belong to their respective rights holders.
+GPL-3.0 (see `LICENSE.txt`). Treat the add-on as an unofficial community tool;
+Final Exam and its assets belong to their respective rights holders.
