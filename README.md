@@ -10,23 +10,23 @@ animations have not been verified because no PS3 `.ani` files were available.
 
 ---
 
-## Guia rápido (PT-BR)
+## Quick Guide
 
-* **Instale a pasta `Zwo Exporter` inteira** (a pasta de fora, que contém
-  `__init__.py` e `README.md`). Ao criar um ZIP para instalar, o ZIP precisa
-  conter a estrutura `Zwo Exporter\__init__.py` + `Zwo Exporter\zwo_exporter\`.
-  Zipe a pasta **main inteira**, nunca só a pasta interna `zwo_exporter` — ela é
-  apenas a camada de formato e não é um add-on.
-* **Importe o `.zwo` a partir da árvore de jogo extraída completa.** O `.geo`
-  (geometria) precisa estar **na mesma pasta, com o mesmo nome** do `.zwo`
-  (`basic.zwo` → `basic.geo`). Um `.zwo` copiado sozinho para outra pasta não
-  tem como gerar malhas.
-* Para **texturas**, o `.hvt` correspondente também precisa estar extraído.
-* Para **animações**, os arquivos `.ani` também precisam estar extraídos (ficam
-  normalmente em `...\anims\` ou `...\anims\all\`). Importe primeiro o `.zwo` do
-  personagem, selecione o armature e só então importe o `.ani`.
-* Mantenha a estrutura `data\common\...` e `data\maps\...` intacta; não mova
-  arquivos isolados para fora dela.
+* **Install the entire `Zwo Exporter` folder** (the outer folder, which contains
+  `__init__.py` and `README.md`). When creating a ZIP file for installation, the ZIP file must
+  contain the structure `Zwo Exporter\__init__.py` + `Zwo Exporter\zwo_exporter\`.
+  Zip the **entire main** folder—never just the inner `zwo_exporter` folder—since it is
+  merely the formatting layer and is not an add-on.
+* **Import the `.zwo` file from the complete extracted game tree.** The `.geo`
+  (geometry) file must be **in the same folder and have the same name** as the `.zwo`
+  file (`basic.zwo` → `basic.geo`). A `.zwo` file copied on its own to another folder cannot
+  generate meshes.
+* For **textures**, the corresponding `.hvt` file must also be extracted.
+* For **animations**, the `.ani` files must also be extracted (they are
+  usually located in `...\anims\` or `...\anims\all\`). First import the character's `.zwo` file,
+  select the armature, and only then import the `.ani` file.
+* Keep the `data\common\...` and `data\maps\...` structure intact; do not move
+  individual files outside of it.
 
 ---
 
