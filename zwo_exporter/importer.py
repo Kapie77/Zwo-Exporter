@@ -28,6 +28,8 @@ YUP_TO_ZUP = Matrix(((1.0, 0.0, 0.0, 0.0),
 
 MESH_NODE_TAGS = ("ZENT", "ZSKI")
 _BONE_SUFFIX = "_zwo_bone"
+#: Name of the colour attribute that receives the `.geo` per-vertex tint.
+VERTEX_COLOUR_LAYER = "zwo_color"
 
 
 # ----------------------------------------------------------------- helpers
@@ -131,8 +133,10 @@ def _material_key(name):
     return "zwo:" + name
 
 
-def _build_material(mat, asset_root, use_textures, report):
+def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=False):
     key = _material_key(mat.path or mat.name or "material")
+    if use_vertex_colour:
+        key += "#vcol"
     existing = bpy.data.materials.get(key)
     if existing is not None:
         return existing
@@ -168,27 +172,136 @@ def _build_material(mat, asset_root, use_textures, report):
 
     if props.get("twosided"):
         material.use_backface_culling = False
-    if alpha < 0.999 or props.get("usealpha") or props.get("alpha"):
+
+    # Characters use "usealpha" as a cut-out mask (hair, nets, straps), not as
+    # smooth transparency: blending the whole material makes the model look
+    # washed out, so the alpha is thresholded into a dithered cut-out instead.
+    # Real translucency (opacity < 1 or additive) keeps smooth blending.
+    smooth_alpha = isinstance(opacity, (int, float)) and float(opacity) < 0.99
+    additive = bool(props.get("additive"))
+    clip_alpha = bool(props.get("usealpha") or props.get("alpha")) and not smooth_alpha
+
+    if additive and hasattr(material, "blend_type"):
+        material.blend_type = "ADD"
+    if smooth_alpha or additive:
+        if hasattr(material, "surface_render_method"):
+            material.surface_render_method = "BLENDED"
+        if hasattr(material, "blend_method"):
+            material.blend_method = "BLEND"
+    elif clip_alpha:
         if hasattr(material, "surface_render_method"):
             material.surface_render_method = "DITHERED"
         if hasattr(material, "blend_method"):
-            material.blend_method = "BLEND"
-    if props.get("additive") and hasattr(material, "blend_type"):
-        material.blend_type = "ADD"
+            material.blend_method = "CLIP"
 
-    if use_textures and mat.texture_path:
-        path = texture_path_for_asset(mat.texture_path, asset_root)
+    base_socket = None
+    alpha_socket = None
+    vcol_socket = None
+
+    # `.geo` vertex colours tint the atlas: the white/neutral parts of the
+    # texture take their colour per vertex (backpack, skin, monster hide, ...).
+    if use_vertex_colour:
+        vcol = nodes.new("ShaderNodeVertexColor")
+        vcol.layer_name = VERTEX_COLOUR_LAYER
+        vcol.location = (-760, 120)
+        vcol_socket = vcol.outputs["Color"]
+
+    # "_onlycolordiffuse" is a neutral 4x4 placeholder: the real colour comes
+    # from the blob-shading ramp below (tentacles, nests, phials, ...).
+    diffuse_name = mat.texture_path
+    placeholder = bool(diffuse_name) and \
+        os.path.basename(diffuse_name).lower() == "_onlycolordiffuse"
+
+    if use_textures and diffuse_name and not placeholder:
+        path = texture_path_for_asset(diffuse_name, asset_root)
         if path:
             image = _load_texture(path, report)
             if image is not None:
                 tex = nodes.new("ShaderNodeTexImage")
                 tex.image = image
                 tex.location = (-520, 320)
-                links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
-                if alpha < 0.999 or props.get("usealpha"):
-                    links.new(tex.outputs["Alpha"], bsdf.inputs["Alpha"])
+                if vcol_socket is not None:
+                    mix = nodes.new("ShaderNodeMix")
+                    mix.data_type = "RGBA"
+                    mix.blend_type = "MULTIPLY"
+                    mix.location = (-240, 320)
+                    mix.inputs["Factor"].default_value = 1.0
+                    links.new(tex.outputs["Color"], mix.inputs[6])
+                    links.new(vcol_socket, mix.inputs[7])
+                    base_socket = mix.outputs[2]
+                else:
+                    base_socket = tex.outputs["Color"]
+                if smooth_alpha or additive:
+                    alpha_socket = tex.outputs["Alpha"]
+                elif clip_alpha:
+                    clip = nodes.new("ShaderNodeMath")
+                    clip.operation = "GREATER_THAN"
+                    clip.inputs[1].default_value = 0.5
+                    clip.location = (-240, 60)
+                    links.new(tex.outputs["Alpha"], clip.inputs[0])
+                    alpha_socket = clip.outputs[0]
+            else:
+                report["bad_textures"].add(path)
         else:
-            report["missing_textures"].add(mat.texture_path)
+            report["missing_textures"].add(diffuse_name)
+
+    # Monster materials store a colour ramp in "blobshadingtexture" (green ->
+    # yellow for the mutants, red for the boss, ...).  When the diffuse is the
+    # neutral placeholder the ramp *is* the colour; on textured monsters it is
+    # added as a soft facing-weighted sheen so they get the green tint the game
+    # shows instead of a flat grey hide.
+    blob_name = props.get("blobshadingtexture")
+    if use_textures and blob_name:
+        blob_path = texture_path_for_asset(blob_name, asset_root)
+        if blob_path:
+            blob_image = _load_texture(blob_path, report)
+            if blob_image is not None:
+                facing = nodes.new("ShaderNodeLayerWeight")
+                facing.inputs["Blend"].default_value = 0.5
+                facing.location = (-900, -320)
+                coord = nodes.new("ShaderNodeCombineXYZ")
+                coord.location = (-740, -320)
+                coord.inputs["Y"].default_value = 0.5
+                links.new(facing.outputs["Facing"], coord.inputs["X"])
+                ramp = nodes.new("ShaderNodeTexImage")
+                ramp.image = blob_image
+                ramp.extension = "EXTEND"
+                ramp.interpolation = "Linear"
+                ramp.location = (-560, -320)
+                links.new(coord.outputs[0], ramp.inputs["Vector"])
+                if base_socket is None:
+                    if vcol_socket is not None:
+                        mix = nodes.new("ShaderNodeMix")
+                        mix.data_type = "RGBA"
+                        mix.blend_type = "MULTIPLY"
+                        mix.location = (-240, 320)
+                        mix.inputs["Factor"].default_value = 1.0
+                        links.new(ramp.outputs["Color"], mix.inputs[6])
+                        links.new(vcol_socket, mix.inputs[7])
+                        base_socket = mix.outputs[2]
+                    else:
+                        base_socket = ramp.outputs["Color"]
+                else:
+                    mix = nodes.new("ShaderNodeMix")
+                    mix.data_type = "RGBA"
+                    mix.blend_type = "ADD"
+                    mix.location = (-20, 320)
+                    mix.inputs["Factor"].default_value = 0.35
+                    links.new(base_socket, mix.inputs[6])
+                    links.new(ramp.outputs["Color"], mix.inputs[7])
+                    base_socket = mix.outputs[2]
+            else:
+                report["bad_textures"].add(blob_path)
+        else:
+            report["missing_textures"].add(blob_name)
+
+    if base_socket is None and vcol_socket is not None:
+        base_socket = vcol_socket
+
+    if base_socket is not None:
+        links.new(base_socket, bsdf.inputs["Base Color"])
+    if alpha_socket is not None:
+        links.new(alpha_socket, bsdf.inputs["Alpha"])
 
     normal_name = props.get("normaltexture")
     if use_textures and normal_name and props.get("usenormaltexture", True):
@@ -237,6 +350,34 @@ def _load_texture(path, report):
 
 
 # ------------------------------------------------------------------- meshes
+def _apply_vertex_colours(mesh, data):
+    """Copy the `.geo` per-vertex tint into a colour attribute.
+
+    Most meshes store pure white here, which means "use the texture as is".
+    Characters and monsters use it to colour neutral areas of their atlas
+    (skin, backpacks, hides), so the material multiplies the two.
+    """
+    colours = getattr(mesh, "colors", None)
+    if not colours or len(colours) != len(data.vertices):
+        return False
+    tinted = False
+    for colour in colours:
+        if abs(colour[0] - 1.0) > 1e-3 or abs(colour[1] - 1.0) > 1e-3 \
+                or abs(colour[2] - 1.0) > 1e-3:
+            tinted = True
+            break
+    if not tinted:
+        return False
+    try:
+        attribute = data.color_attributes.new(name=VERTEX_COLOUR_LAYER,
+                                              type="FLOAT_COLOR", domain="POINT")
+    except (AttributeError, TypeError, RuntimeError):
+        return False
+    for index, colour in enumerate(colours):
+        attribute.data[index].color = (colour[0], colour[1], colour[2], 1.0)
+    return True
+
+
 def _build_mesh_object(mesh, node, matrix, collection, asset_root, options, report):
     name = node.name if node else "mesh_%03d" % max(0, mesh.index)
     data = bpy.data.meshes.new(name + "_mesh")
@@ -254,6 +395,8 @@ def _build_mesh_object(mesh, node, matrix, collection, asset_root, options, repo
             index = loop.vertex_index
             if index < len(uvs):
                 layer.data[loop.index].uv = (uvs[index][0], 1.0 - uvs[index][1])
+
+    use_vertex_colour = _apply_vertex_colours(mesh, data)
 
     for polygon in data.polygons:
         polygon.use_smooth = True
@@ -289,14 +432,16 @@ def _build_mesh_object(mesh, node, matrix, collection, asset_root, options, repo
             continue
         slots[id(material)] = len(data.materials)
         data.materials.append(_build_material(material, asset_root,
-                                             use_textures, report))
+                                             use_textures, report,
+                                             use_vertex_colour))
     if not data.materials:
         material = mesh.material
         if material is None and report["geo"] is not None and report["geo"].materials:
             material = report["geo"].materials[0]
         if material is not None:
             data.materials.append(_build_material(material, asset_root,
-                                                 use_textures, report))
+                                                 use_textures, report,
+                                                 use_vertex_colour))
             slots[id(material)] = 0
     if calls:
         if len(data.polygons) == len(mesh.faces):

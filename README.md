@@ -42,7 +42,7 @@ animations have not been verified because no PS3 `.ani` files were available.
 | ------ | ------ | ------ | ----- |
 | `.zwo`  | yes | yes | scene hierarchy, transforms, node metadata |
 | `.geo`  | yes | yes | meshes, UVs, normals, skin weights, material table, draw-call material ranges |
-| `.hvt`  | yes | no  | DXT/ARGB payload wrapped in a generated DDS |
+| `.hvt`  | yes | no  | DXT1/DXT3/DXT5 and uncompressed ARGB/XRGB wrapped in a generated DDS |
 | `.ani`  | yes | no  | skeletal and object animation (import only) |
 
 * Imports all mesh data as Blender meshes, groups them in one collection per
@@ -54,12 +54,45 @@ animations have not been verified because no PS3 `.ani` files were available.
 * Skinned characters get an armature whose rest bones exactly match the scene
   node world matrices, and vertex groups are built from the `.geo` weights.
 * Textures are decoded to temporary DDS files and hooked into Principled BSDF
-  materials.
+  materials. Every `.hvt` format in the shipped data is supported (DXT1, DXT3,
+  DXT5 and the uncompressed ARGB/XRGB variants).
+* Per-vertex colours stored in the `.geo` are imported as the `zwo_color`
+  attribute and multiplied into the base colour. This is what gives schoolkids
+  their skin, backpack and clothing tints; without it those areas look white.
+* Monster materials use their stored `blobshadingtexture` ramp (green → yellow
+  for the mutants, red for the boss) as a facing-weighted sheen, which brings
+  back the green look of the tank/jumper/basic monsters. Meshes whose diffuse
+  texture is the neutral `_onlycolordiffuse` placeholder (tentacles, nests,
+  plants) take their colour entirely from that ramp.
+* `usealpha` / `alpha` are treated as a **cut-out** mask (alpha thresholded and
+  dithered) instead of smooth transparency, so characters such as Cassy no
+  longer look washed out. Only `opacity < 1` or `additive` keep real blending.
 * Export writes edits back into the original byte stream: untouched files
   round-trip byte-for-byte, changed meshes are rebuilt, and everything else
   (unknown tails, opaque records, checksums) is preserved verbatim.
 * A `.bak` copy of the original `.zwo`/`.geo` pair is created before the first
   overwrite.
+
+## Materials
+
+Materials are rebuilt from the `.geo` palette. The properties that drive the
+look are mapped like this:
+
+| `.geo` property | Blender |
+| --------------- | ------- |
+| `diffusetexture` | Base Color texture |
+| `diffusecolor` | fallback Base Color |
+| `normaltexture` + `normalmapboost` | Normal Map |
+| `.geo` vertex colour | `zwo_color` attribute, multiplied into Base Color |
+| `blobshadingtexture` | facing-weighted colour ramp (monster green, boss red, ...) |
+| `glossiness` / `specularmultiplier` | Roughness / Specular |
+| `usealpha` / `alpha` | cut-out alpha (thresholded, dithered) |
+| `opacity` / `additive` | smooth alpha blending |
+| `twosided` | backface culling off |
+
+Characters usually have one material and one texture; the per-part colours
+(skin, backpack, uniform, monster hide) come from the vertex colours stored in
+the `.geo`, not from separate materials.
 
 ## Installation
 
@@ -188,6 +221,12 @@ Tested against the shipped PC data:
   and assigned per face range. This reproduces the game's material layout on all
   353 shipped `.geo` files (11,763 / 11,763 draw calls). Only 24 meshes have no
   usable draw-call list and still fall back to path/name matching.
+* **The boost/glow state is not reproduced.** `characterglow`, `boostedversion`
+  and the green "boosted" portraits are runtime shader/lighting effects. The
+  importer approximates the base look with the stored `blobshadingtexture`
+  ramp, but it does not switch materials into their boosted state.
+* **The grayscale `shadingtexture` toon ramp is not applied.** It is a lighting
+  ramp (`character_shading`, black → white); Blender lights the models instead.
 * **Mesh/node association is name based.** Ambiguous names fall back to
   positional matching and are reported as warnings.
 * **Instancing** is detected from shared geometry and kept on export, but the

@@ -59,7 +59,8 @@ class HvtTexture:
                              self.width * 4, 0, max(1, len(mips)))
         header += b"\x00" * 44
         alpha = 0x8 if self.format == "ARGB" else 0x0
-        header += struct.pack("<2I", 32, 0x41 | alpha)
+        header += struct.pack("<2I", 32, 0x41 | alpha)   # size, flags
+        header += struct.pack("<2I", 0, 32)              # fourCC (0 = RGB), bit count
         header += struct.pack("<4I", 0x00FF0000, 0x0000FF00,
                               0x000000FF, 0xFF000000 if alpha else 0)
         header += struct.pack("<5I", 0, 0, 0, 0, 0)
