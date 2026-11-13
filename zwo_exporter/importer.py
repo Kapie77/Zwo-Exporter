@@ -280,12 +280,39 @@ def _build_mesh_object(mesh, node, matrix, collection, asset_root, options, repo
     if mesh.bone_names:
         obj["zwo_bones"] = ";".join(mesh.bone_names)
 
-    material = mesh.material
-    if material is None and report["geo"] is not None and report["geo"].materials:
-        material = report["geo"].materials[0]
-    if material is not None:
+    use_textures = options.get("textures", True)
+    slots = {}
+    calls = getattr(mesh, "draw_calls", [])
+    for call in calls:
+        material = call.material
+        if material is None or id(material) in slots:
+            continue
+        slots[id(material)] = len(data.materials)
         data.materials.append(_build_material(material, asset_root,
-                                             options.get("textures", True), report))
+                                             use_textures, report))
+    if not data.materials:
+        material = mesh.material
+        if material is None and report["geo"] is not None and report["geo"].materials:
+            material = report["geo"].materials[0]
+        if material is not None:
+            data.materials.append(_build_material(material, asset_root,
+                                                 use_textures, report))
+            slots[id(material)] = 0
+    if calls:
+        if len(data.polygons) == len(mesh.faces):
+            for call in calls:
+                slot = slots.get(id(call.material))
+                if slot is None:
+                    continue
+                start = call.first_face
+                end = start + call.face_count
+                for index in range(start, end):
+                    data.polygons[index].material_index = slot
+        else:
+            report["warnings"].append(
+                "%s: face count changed during import (%d -> %d); "
+                "multi-material ranges may be approximate"
+                % (name, len(mesh.faces), len(data.polygons)))
     return obj
 
 

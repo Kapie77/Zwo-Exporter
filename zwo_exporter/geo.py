@@ -31,6 +31,13 @@ A block is:
 Known blocks:
     VBFL  vertex buffer     [u32 format][u32 format2][u32 count][count * vertex]
     ZFBU  face buffer       [u32 face_count][face_count * 3 * u16][u32 0]
+    ZSEQ  draw calls        [u32 count][u32 0]
+                            [count * (u32 indexOffset, u32 0, u32 faceCount,
+                                      u32 materialHash, u32 flags)]
+
+``materialHash`` is ``CRC32(material.path.lower())``.  A mesh can be split into
+several draw calls, each with its own material, which is how multi-material
+objects are stored.
 
 The vertex record is described by :func:`vertex_layout`.  On top of the
 common prefix ``[x][y][A][B][C][color][u,v]`` every record ends with the ``z``
@@ -50,6 +57,7 @@ and ``uv`` is two IEEE half floats packed into one word.
 """
 
 import struct
+import zlib
 
 from .binio import Reader, Writer, detect_endian
 
@@ -128,6 +136,31 @@ class GeoMaterial:
         return "<GeoMaterial %r tex=%r>" % (self.name, self.texture_path)
 
 
+class GeoDrawCall:
+    """One ``ZSEQ`` draw call: a face range plus the material that draws it.
+
+    ``material_hash`` is ``CRC32(material.path.lower())``; it is resolved to a
+    :class:`GeoMaterial` once the file's material palette has been parsed.
+    """
+
+    __slots__ = ("index_offset", "face_count", "material_hash", "flags", "material")
+
+    def __init__(self, index_offset=0, face_count=0, material_hash=0, flags=0):
+        self.index_offset = index_offset      # byte/word offset into the index buffer
+        self.face_count = face_count
+        self.material_hash = material_hash
+        self.flags = flags
+        self.material = None
+
+    @property
+    def first_face(self):
+        return self.index_offset // 3
+
+    def __repr__(self):
+        return "<GeoDrawCall faces=%d..%d mat=%#010x>" % (
+            self.first_face, self.first_face + self.face_count, self.material_hash)
+
+
 class GeoMesh:
     def __init__(self):
         self.tag = "GMES"
@@ -152,6 +185,7 @@ class GeoMesh:
         self.payload_size = 0
         self.material = None
         self.material_path = ""
+        self.draw_calls = []        # GeoDrawCall per ZSEQ face range
         self.model_path = ""        # name/path string stored before the record
         self.bone_names = []
         self.bounds = None
@@ -352,9 +386,32 @@ def _parse_mesh(data, endian, off, size):
             if not mesh.faces and face_payload is not None:
                 _decode_faces(mesh, endian, face_payload.payload)
 
+    mesh.draw_calls = _parse_draw_calls(mesh, endian)
+
     # A skinned mesh lists its bone names in the root tail.
     mesh.bone_names = _tail_strings(mesh.tail, endian)
     return mesh
+
+
+def _parse_draw_calls(mesh, endian):
+    """Decode the first valid ``ZSEQ`` block into per-material face ranges."""
+    for block in mesh.blocks:
+        if block.tag != "ZSEQ" or len(block.payload) < 8:
+            continue
+        count = struct.unpack_from(endian + "I", block.payload, 0)[0]
+        if count == 0 or len(block.payload) != 8 + count * 20:
+            continue
+        calls = []
+        for k in range(count):
+            index_offset, _zero, face_count, material_hash, flags = \
+                struct.unpack_from(endian + "5I", block.payload, 8 + k * 20)
+            if index_offset % 3 or index_offset // 3 + face_count > len(mesh.faces):
+                calls = None
+                break
+            calls.append(GeoDrawCall(index_offset, face_count, material_hash, flags))
+        if calls and sum(call.face_count for call in calls) == len(mesh.faces):
+            return calls
+    return []
 
 
 def vertex_layout(endian, stride):
@@ -698,14 +755,21 @@ def _preceding_string(data, endian, off):
 
 
 def _assign_materials(geo):
-    """Best-effort association between meshes and the file material palette.
+    """Resolve mesh materials from the palette and the ``ZSEQ`` draw calls.
 
-    The palette is a flat list; there is no explicit mesh -> material index in
-    the records, so the mesh path is matched against the material paths.
+    Each draw call stores ``CRC32(material.path.lower())``.  That gives an exact
+    mesh/submesh -> material association, including multi-material meshes.  The
+    path heuristic below is kept as a fallback for the few meshes without a
+    usable draw-call list.
     """
     if not geo.materials:
         return
     by_path = {mat.path.lower(): mat for mat in geo.materials if mat.path}
+    by_hash = {}
+    for mat in geo.materials:
+        if mat.path:
+            key = zlib.crc32(mat.path.lower().encode("latin-1")) & 0xFFFFFFFF
+            by_hash.setdefault(key, mat)
     by_name = {}
     for mat in geo.materials:
         by_name.setdefault(mat.name.lower(), mat)
@@ -739,8 +803,20 @@ def _assign_materials(geo):
                 material = best[1]
         if material is None:
             material = by_name.get("main_static") or geo.materials[0]
+        # Exact per-draw-call resolution (authoritative when present).
+        if mesh.draw_calls:
+            first = None
+            for call in mesh.draw_calls:
+                resolved = by_hash.get(call.material_hash)
+                if resolved is None:
+                    resolved = material
+                call.material = resolved
+                if first is None:
+                    first = resolved
+            if first is not None:
+                material = first
         mesh.material = material
-        mesh.material_path = material.path
+        mesh.material_path = material.path if material is not None else ""
 
 
 # ---------------------------------------------------------------- writing

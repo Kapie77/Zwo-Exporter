@@ -41,12 +41,16 @@ animations have not been verified because no PS3 `.ani` files were available.
 | Format | Import | Export | Notes |
 | ------ | ------ | ------ | ----- |
 | `.zwo`  | yes | yes | scene hierarchy, transforms, node metadata |
-| `.geo`  | yes | yes | meshes, UVs, normals, skin weights, material table |
+| `.geo`  | yes | yes | meshes, UVs, normals, skin weights, material table, draw-call material ranges |
 | `.hvt`  | yes | no  | DXT/ARGB payload wrapped in a generated DDS |
 | `.ani`  | yes | no  | skeletal and object animation (import only) |
 
 * Imports all mesh data as Blender meshes, groups them in one collection per
   asset, and rebuilds lights and (optionally) cameras.
+* Materials come from the `.geo` palette by **exact hash**: every `ZSEQ` draw
+  call stores `CRC32(material path)`, so each face range gets the material the
+  game really uses. Meshes split across several draw calls get several material
+  slots (1,230 meshes in the shipped PC data are multi-material).
 * Skinned characters get an armature whose rest bones exactly match the scene
   node world matrices, and vertex groups are built from the `.geo` weights.
 * Textures are decoded to temporary DDS files and hooked into Principled BSDF
@@ -179,10 +183,11 @@ Tested against the shipped PC data:
 * **Checksums are not recomputed.** `.geo` block checksums are not CRC32 and
   their algorithm is unknown, so they are preserved byte-for-byte. This is fine
   for untouched blocks; rebuilt geometry keeps the original checksum value.
-* **Material assignment is heuristic.** The format does not expose an explicit
-  mesh→material index; materials are assigned by path/name matching. This works
-  for maps and most props, but character parts (e.g. `flyer`) may need manual
-  fixes.
+* **Materials are exact, with a small fallback.** Each `ZSEQ` draw call carries
+  `CRC32(material.path.lower())`, which is resolved against the `.geo` palette
+  and assigned per face range. This reproduces the game's material layout on all
+  353 shipped `.geo` files (11,763 / 11,763 draw calls). Only 24 meshes have no
+  usable draw-call list and still fall back to path/name matching.
 * **Mesh/node association is name based.** Ambiguous names fall back to
   positional matching and are reported as warnings.
 * **Instancing** is detected from shared geometry and kept on export, but the
