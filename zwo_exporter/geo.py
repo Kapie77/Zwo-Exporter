@@ -95,14 +95,19 @@ FMT_FLAGS4 = 0x00100000
 
 
 class GeoBlock:
-    __slots__ = ("id", "checksum", "tag", "payload", "offset")
+    __slots__ = ("id", "checksum", "tag", "payload", "offset", "gap_before")
 
-    def __init__(self, block_id=0, checksum=0, tag="", payload=b"", offset=0):
+    def __init__(self, block_id=0, checksum=0, tag="", payload=b"", offset=0,
+                 gap_before=b""):
         self.id = block_id
         self.checksum = checksum
         self.tag = tag
         self.payload = payload
         self.offset = offset
+        # Alignment padding found before this block in the source file.  Most
+        # meshes chain their blocks back to back, but a few (flyer_catcher's
+        # body) insert a zero word between the vertex and face buffers.
+        self.gap_before = gap_before
 
     def __repr__(self):
         return "<GeoBlock %s id=%d len=%d>" % (self.tag, self.id, len(self.payload))
@@ -320,36 +325,62 @@ def _valid_root(data, endian, off, size):
         and 0 <= length <= len(data) - (p + 20)
 
 
+MAX_BLOCK_GAP = 64
+
+
+def _block_header(data, endian, pos, end):
+    """Return ``(payload_length, tag_name)`` when ``pos`` starts a block."""
+    if pos < 0 or pos + 20 > end:
+        return None
+    length = struct.unpack_from(endian + "I", data, pos + 8)[0]
+    tag, tag2 = data[pos + 12:pos + 16], data[pos + 16:pos + 20]
+    name = _tag_name(tag, endian) if tag == tag2 else None
+    if name not in BLOCK_TAGS:
+        return None
+    payload_at = pos + 20
+    if length > len(data) - payload_at or payload_at + length > end:
+        return None
+    return length, name
+
+
 def _parse_blocks(data, endian, pos, end):
     blocks = []
     guard = 0
+    gap = b""
     while pos + 20 <= end and guard < 100000:
         guard += 1
-        length = struct.unpack_from(endian + "I", data, pos + 8)[0]
-        tag, tag2 = data[pos + 12:pos + 16], data[pos + 16:pos + 20]
-        name = _tag_name(tag, endian) if tag == tag2 else None
-        if name not in BLOCK_TAGS:
+        header = _block_header(data, endian, pos, end)
+        if header is None:
+            # Some blocks deliberately overlap the next block header by four
+            # bytes; others leave a small zero-filled alignment gap.
             alt = pos - 4
-            alt_tag = data[alt + 12:alt + 16] if alt >= 0 else b""
-            alt_name = _tag_name(alt_tag, endian) if alt_tag else ""
-            if alt >= 0 and data[alt + 12:alt + 16] == data[alt + 16:alt + 20] \
-                    and alt_name in BLOCK_TAGS:
+            header = _block_header(data, endian, alt, end) if alt >= 0 else None
+            if header is not None:
                 pos = alt
-                length = struct.unpack_from(endian + "I", data, pos + 8)[0]
-                tag = alt_tag
-                name = alt_name
             else:
-                break
+                found = None
+                for shift in range(4, MAX_BLOCK_GAP + 1, 4):
+                    candidate = pos + shift
+                    candidate_header = _block_header(data, endian, candidate, end)
+                    if candidate_header is not None:
+                        found = (candidate, candidate_header)
+                        break
+                if found is None:
+                    break
+                candidate, header = found
+                gap += data[pos:candidate]
+                pos = candidate
+        length, name = header
         payload_at = pos + 20
-        if length > len(data) - payload_at or payload_at + length > end:
-            break
         blocks.append(GeoBlock(
             struct.unpack_from(endian + "I", data, pos)[0],
             struct.unpack_from(endian + "I", data, pos + 4)[0],
             name,
             data[payload_at:payload_at + length],
             pos,
+            gap,
         ))
+        gap = b""
         pos = payload_at + length
     return blocks, pos
 
@@ -837,7 +868,8 @@ def _write_mesh(w, mesh):
     # payload = [face_count][block0 id][block0 checksum][block0 size]
     #           [block0 tag][block0 tag][block0 payload]
     #           [blockN id][blockN checksum][blockN size][tag][tag][payload]...
-    payload_len = 4 + sum(20 + len(block.payload) for block in updated)
+    payload_len = 4 + sum(len(block.gap_before) + 20 + len(block.payload)
+                          for block in updated)
     head = list(mesh.head_ints)
     if updated:
         head[1], head[2], head[3] = updated[0].id, updated[0].checksum, len(updated[0].payload)
@@ -846,11 +878,14 @@ def _write_mesh(w, mesh):
     w.tag("GMES" if mesh.tag == "GMES" else mesh.tag)
     w.u32(payload_len)
     w.u32(head[0])
+    if updated:
+        w.raw(updated[0].gap_before)
     w.u32(head[1])
     w.u32(head[2])
     w.u32(head[3])
     for index, block in enumerate(updated):
         if index:
+            w.raw(block.gap_before)
             w.u32(block.id)
             w.u32(block.checksum)
             w.u32(len(block.payload))
@@ -872,11 +907,13 @@ def _rebuild_block_payloads(endian, mesh, blocks):
                 extra = block.payload[12 + stride * count:]
                 payload = _encode_vertices(endian, mesh, fmt, fmt2)
                 payload += extra
-                out.append(GeoBlock(block.id, block.checksum, block.tag, payload, block.offset))
+                out.append(GeoBlock(block.id, block.checksum, block.tag, payload,
+                                    block.offset, block.gap_before))
                 continue
         elif block.tag == "ZFBU" and len(block.payload) >= 8 and mesh.needs_rebuild:
             payload = _encode_faces(endian, mesh)
-            out.append(GeoBlock(block.id, block.checksum, block.tag, payload, block.offset))
+            out.append(GeoBlock(block.id, block.checksum, block.tag, payload,
+                                block.offset, block.gap_before))
             continue
         out.append(block)
     return out

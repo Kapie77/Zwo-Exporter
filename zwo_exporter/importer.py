@@ -133,6 +133,16 @@ def _material_key(name):
     return "zwo:" + name
 
 
+def _mask_colour(nodes, links, value_socket, location):
+    """Expand a scalar mask into a grey colour so it can feed a Mix node."""
+    combine = nodes.new("ShaderNodeCombineColor")
+    combine.mode = "RGB"
+    combine.location = location
+    for channel in ("Red", "Green", "Blue"):
+        links.new(value_socket, combine.inputs[channel])
+    return combine.outputs[0]
+
+
 def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=False):
     key = _material_key(mat.path or mat.name or "material")
     if use_vertex_colour:
@@ -212,6 +222,25 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
     placeholder = bool(diffuse_name) and \
         os.path.basename(diffuse_name).lower() == "_onlycolordiffuse"
 
+    # The shipped monster shader (shadow0/monster.fx) does not tint the texture
+    # with the vertex colour: it uses the red channel as a blend mask between
+    # the lit diffuse texture and the blob-shading ramp.  White keeps the
+    # texture (the "Hitter" body, which is genuinely dark brown in the shipped
+    # atlas); red = 0 selects the unlit ramp (green head, mouth and other
+    # organic patches).  Character materials still multiply the whole vertex
+    # colour into the atlas.
+    #
+    # The engine picks a shader from the material's parameter set.  Every
+    # `monster.zfx` variant takes an env map, while `monster_wing.zfx` and the
+    # standalone `blob.zfx` rim pass do not, so the presence of
+    # `envmaptexture` is what separates "blob shaded" from "just a ramp".
+    #
+    # `monster_wing.zfx` only reads the red channel of the vertex colour (it
+    # animates the membrane), so those materials must not be tinted by RGB.
+    blob_name = props.get("blobshadingtexture")
+    blob_shader = bool(blob_name) and bool(props.get("envmaptexture"))
+    vcol_tint = vcol_socket is not None and not blob_name
+
     if use_textures and diffuse_name and not placeholder:
         path = texture_path_for_asset(diffuse_name, asset_root)
         if path:
@@ -220,7 +249,7 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
                 tex = nodes.new("ShaderNodeTexImage")
                 tex.image = image
                 tex.location = (-520, 320)
-                if vcol_socket is not None:
+                if vcol_tint:
                     mix = nodes.new("ShaderNodeMix")
                     mix.data_type = "RGBA"
                     mix.blend_type = "MULTIPLY"
@@ -245,51 +274,84 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
         else:
             report["missing_textures"].add(diffuse_name)
 
-    # Monster materials store a colour ramp in "blobshadingtexture" (green ->
-    # yellow for the mutants, red for the boss, ...).  When the diffuse is the
-    # neutral placeholder the ramp *is* the colour; on textured monsters it is
-    # added as a soft facing-weighted sheen so they get the green tint the game
-    # shows instead of a flat grey hide.
-    blob_name = props.get("blobshadingtexture")
-    if use_textures and blob_name:
+    # "blobshadingtexture" is a 1D colour ramp sampled by
+    # fresnel = 1 - dot(normal, view).  The game scales it by
+    # 4 - 2.5 * LightDarkDefaultFactor (1.5 at the default factor of 1) and
+    # then does:
+    #
+    #     color = lerp(blob, diffuse * (lighting + 0.5), vcol.red)
+    #
+    # The blob term is never multiplied by the lights, so it is reproduced
+    # through the emission socket instead of the base colour:
+    #
+    #     base     = diffuse * vcol.red
+    #     emission = blob * (1 - vcol.red)
+    #
+    # which is the same sum, with the lit part left for Blender's lights.
+    if use_textures and blob_shader and vcol_socket is not None:
         blob_path = texture_path_for_asset(blob_name, asset_root)
         if blob_path:
             blob_image = _load_texture(blob_path, report)
             if blob_image is not None:
+                separate = nodes.new("ShaderNodeSeparateColor")
+                separate.mode = "RGB"
+                separate.location = (-900, 120)
+                links.new(vcol_socket, separate.inputs["Color"])
+                red = separate.outputs["Red"]
+
                 facing = nodes.new("ShaderNodeLayerWeight")
                 facing.inputs["Blend"].default_value = 0.5
-                facing.location = (-900, -320)
+                facing.location = (-1100, -320)
                 coord = nodes.new("ShaderNodeCombineXYZ")
-                coord.location = (-740, -320)
-                coord.inputs["Y"].default_value = 0.5
+                coord.location = (-940, -320)
+                coord.inputs["Y"].default_value = 0.0
                 links.new(facing.outputs["Facing"], coord.inputs["X"])
                 ramp = nodes.new("ShaderNodeTexImage")
                 ramp.image = blob_image
                 ramp.extension = "EXTEND"
                 ramp.interpolation = "Linear"
-                ramp.location = (-560, -320)
+                ramp.location = (-760, -320)
                 links.new(coord.outputs[0], ramp.inputs["Vector"])
-                if base_socket is None:
-                    if vcol_socket is not None:
-                        mix = nodes.new("ShaderNodeMix")
-                        mix.data_type = "RGBA"
-                        mix.blend_type = "MULTIPLY"
-                        mix.location = (-240, 320)
-                        mix.inputs["Factor"].default_value = 1.0
-                        links.new(ramp.outputs["Color"], mix.inputs[6])
-                        links.new(vcol_socket, mix.inputs[7])
-                        base_socket = mix.outputs[2]
-                    else:
-                        base_socket = ramp.outputs["Color"]
+
+                scale = nodes.new("ShaderNodeMix")
+                scale.data_type = "RGBA"
+                scale.blend_type = "MULTIPLY"
+                scale.location = (-560, -320)
+                scale.inputs["Factor"].default_value = 1.0
+                scale.inputs[7].default_value = (1.5, 1.5, 1.5, 1.0)
+                links.new(ramp.outputs["Color"], scale.inputs[6])
+                blob_socket = scale.outputs[2]
+
+                # base = diffuse * red
+                lit = nodes.new("ShaderNodeMix")
+                lit.data_type = "RGBA"
+                lit.blend_type = "MULTIPLY"
+                lit.location = (-320, 320)
+                lit.inputs["Factor"].default_value = 1.0
+                if base_socket is not None:
+                    links.new(base_socket, lit.inputs[6])
                 else:
-                    mix = nodes.new("ShaderNodeMix")
-                    mix.data_type = "RGBA"
-                    mix.blend_type = "ADD"
-                    mix.location = (-20, 320)
-                    mix.inputs["Factor"].default_value = 0.35
-                    links.new(base_socket, mix.inputs[6])
-                    links.new(ramp.outputs["Color"], mix.inputs[7])
-                    base_socket = mix.outputs[2]
+                    lit.inputs[6].default_value = (1.0, 1.0, 1.0, 1.0)
+                links.new(_mask_colour(nodes, links, red, (-520, 200)), lit.inputs[7])
+                base_socket = lit.outputs[2]
+
+                # emission = blob * (1 - red)
+                inverse = nodes.new("ShaderNodeMath")
+                inverse.operation = "SUBTRACT"
+                inverse.inputs[0].default_value = 1.0
+                inverse.location = (-520, -60)
+                links.new(red, inverse.inputs[1])
+
+                glow = nodes.new("ShaderNodeMix")
+                glow.data_type = "RGBA"
+                glow.blend_type = "MULTIPLY"
+                glow.location = (-320, -320)
+                glow.inputs["Factor"].default_value = 1.0
+                links.new(blob_socket, glow.inputs[6])
+                links.new(_mask_colour(nodes, links, inverse.outputs[0], (-520, -160)),
+                          glow.inputs[7])
+                links.new(glow.outputs[2], bsdf.inputs["Emission Color"])
+                bsdf.inputs["Emission Strength"].default_value = 1.0
             else:
                 report["bad_textures"].add(blob_path)
         else:
@@ -351,11 +413,12 @@ def _load_texture(path, report):
 
 # ------------------------------------------------------------------- meshes
 def _apply_vertex_colours(mesh, data):
-    """Copy the `.geo` per-vertex tint into a colour attribute.
+    """Copy the `.geo` per-vertex colour into a colour attribute.
 
     Most meshes store pure white here, which means "use the texture as is".
-    Characters and monsters use it to colour neutral areas of their atlas
-    (skin, backpacks, hides), so the material multiplies the two.
+    Character materials multiply the RGB tint into the atlas (skin, backpacks).
+    Monster materials only read the red channel, using it as a mask between the
+    lit texture and the blob-shading ramp (see `_build_material`).
     """
     colours = getattr(mesh, "colors", None)
     if not colours or len(colours) != len(data.vertices):

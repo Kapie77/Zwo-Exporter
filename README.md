@@ -57,13 +57,17 @@ animations have not been verified because no PS3 `.ani` files were available.
   materials. Every `.hvt` format in the shipped data is supported (DXT1, DXT3,
   DXT5 and the uncompressed ARGB/XRGB variants).
 * Per-vertex colours stored in the `.geo` are imported as the `zwo_color`
-  attribute and multiplied into the base colour. This is what gives schoolkids
-  their skin, backpack and clothing tints; without it those areas look white.
-* Monster materials use their stored `blobshadingtexture` ramp (green → yellow
-  for the mutants, red for the boss) as a facing-weighted sheen, which brings
-  back the green look of the tank/jumper/basic monsters. Meshes whose diffuse
-  texture is the neutral `_onlycolordiffuse` placeholder (tentacles, nests,
-  plants) take their colour entirely from that ramp.
+  attribute. Characters multiply the full RGB into the base colour, which is
+  what gives schoolkids their skin, backpack and clothing tints; without it
+  those areas look white.
+* Monster materials follow the shipped `shadow0/monster.fx` shader exactly. Its
+  vertex colour is not a tint but a **mask**: the red channel blends between the
+  lit diffuse texture (`red = 1`) and the unlit `blobshadingtexture` ramp
+  (`red = 0`). The importer rebuilds that as `base = diffuse × red` plus
+  `emission = ramp × 1.5 × (1 − red)`, so the body keeps its texture while the
+  eyes, mouth and organic patches keep the green fresnel glow they have in the
+  game. Meshes whose diffuse texture is the neutral `_onlycolordiffuse`
+  placeholder (tentacles, nests, plants) are coloured entirely by the ramp.
 * `usealpha` / `alpha` are treated as a **cut-out** mask (alpha thresholded and
   dithered) instead of smooth transparency, so characters such as Cassy no
   longer look washed out. Only `opacity < 1` or `additive` keep real blending.
@@ -83,16 +87,20 @@ look are mapped like this:
 | `diffusetexture` | Base Color texture |
 | `diffusecolor` | fallback Base Color |
 | `normaltexture` + `normalmapboost` | Normal Map |
-| `.geo` vertex colour | `zwo_color` attribute, multiplied into Base Color |
-| `blobshadingtexture` | facing-weighted colour ramp (monster green, boss red, ...) |
+| `.geo` vertex colour (characters) | `zwo_color` attribute, multiplied into Base Color |
+| `.geo` vertex colour red (monsters) | mask: Base Color = diffuse × red, Emission = ramp × (1 − red) |
+| `blobshadingtexture` | unlit facing ramp (monster green, boss red, ...) |
 | `glossiness` / `specularmultiplier` | Roughness / Specular |
 | `usealpha` / `alpha` | cut-out alpha (thresholded, dithered) |
 | `opacity` / `additive` | smooth alpha blending |
 | `twosided` | backface culling off |
 
 Characters usually have one material and one texture; the per-part colours
-(skin, backpack, uniform, monster hide) come from the vertex colours stored in
-the `.geo`, not from separate materials.
+(skin, backpack, uniform) come from the vertex colours stored in the `.geo`,
+not from separate materials. Monster hides are dark on purpose — the shipped
+`basic_diff`/`tank_diff`/`jumper_diff` atlases are almost black (mean RGB around
+40), and the green cast the Hitter has in screenshots comes from the game's
+green scene lighting, not from a bright texture.
 
 ## Installation
 
@@ -223,8 +231,13 @@ Tested against the shipped PC data:
   usable draw-call list and still fall back to path/name matching.
 * **The boost/glow state is not reproduced.** `characterglow`, `boostedversion`
   and the green "boosted" portraits are runtime shader/lighting effects. The
-  importer approximates the base look with the stored `blobshadingtexture`
-  ramp, but it does not switch materials into their boosted state.
+  importer reproduces the stored `blobshadingtexture` ramp as unlit emission,
+  but it does not switch materials into their boosted state.
+* **Monster brightness depends on the scene.** `monster.fx` computes
+  `diffuse × (lighting + 0.5)`, and the game's green lamps are bright. The
+  importer leaves the diffuse texture at its stored value and lets Blender's
+  lights supply the rest, so a neutral render looks darker and browner than an
+  in-game screenshot.
 * **The grayscale `shadingtexture` toon ramp is not applied.** It is a lighting
   ramp (`character_shading`, black → white); Blender lights the models instead.
 * **Mesh/node association is name based.** Ambiguous names fall back to
