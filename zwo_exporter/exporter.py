@@ -143,6 +143,32 @@ def _matrix_close(a, b, epsilon=1e-5):
                for row in range(4) for col in range(4))
 
 
+def _node_space_world(obj):
+    """Return an object's world matrix in `.zwo` node space.
+
+    Rigid parts of a rig that has a mesh frame (the flyer's wings) are placed at
+    ``frame @ node_world @ bind`` so they sit on the skinned mesh, where ``bind``
+    is the mesh-to-node matrix stored in the node's tail.  The file stores the
+    node world, so both are undone before comparing and writing.
+    """
+    from mathutils import Matrix
+
+    world = obj.matrix_world
+    bind = obj.get("zwo_rigid_bind")
+    if bind:
+        values = list(bind)
+        world = world @ Matrix(tuple(tuple(values[row * 4:(row + 1) * 4])
+                                     for row in range(4))).inverted()
+    stored = obj.get("zwo_frame")
+    if not stored:
+        return world
+
+    values = list(stored)
+    frame = Matrix(tuple(tuple(values[row * 4:(row + 1) * 4])
+                         for row in range(4)))
+    return frame.inverted() @ world
+
+
 def _update_node_transforms(zwo, objects, report):
     """Write every edited object's world transform back into its node.
 
@@ -166,7 +192,7 @@ def _update_node_transforms(zwo, objects, report):
         changed = False
         if obj is not None:
             seen.add(node.source_index)
-            world = obj.matrix_world
+            world = _node_space_world(obj)
             if parent_changed or not _matrix_close(
                     world, original[node.source_index]):
                 _set_local(node, parent_world, world, force=True)

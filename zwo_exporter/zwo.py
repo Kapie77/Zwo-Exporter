@@ -34,6 +34,7 @@ size and are not even 4-byte aligned), so the parser scans for tags and then
 validates each candidate by checking the duplicate tag and the name length.
 """
 
+import math
 import struct
 
 from .binio import Reader, Writer, detect_endian
@@ -51,6 +52,21 @@ ALL_TAGS = NODE_TAGS + OTHER_TAGS
 
 ROOT_STUB_LEN = 105
 TRANSFORM_LEN = 40
+#: Length of the tail stored on a skinned ``ZBON`` node.
+BIND_TAIL_LEN = 109
+#: Offset of the 3x4 inverse bind matrix inside that tail.  The first 61 bytes
+#: are a constant identity block and 13 zero bytes in every shipped file.
+BIND_MATRIX_OFFSET = BIND_TAIL_LEN - 48
+#: Length of the tail stored on a plain ``ZENT`` node.  The first 48 bytes are a
+#: 3x4 mesh-to-node matrix used by rigid parts of a rig (the flyer's wing
+#: membranes); the rest is a constant ``0 0 0 1 0 0 0 0`` block plus a
+#: ``ffffffff`` terminator.
+RIGID_TAIL_LEN = 81
+#: Largest deviation from an orthonormal 3x3 accepted for that matrix.  Props and
+#: FX also carry a 3x4 tail but it is *not* a mesh bind (it re-places decals,
+#: stretches particle strips), so anything that is not a clean rigid transform is
+#: rejected instead of guessed at.
+RIGID_BIND_TOLERANCE = 1e-3
 
 
 class ZwoNode:
@@ -109,6 +125,67 @@ class ZwoNode:
 
     def __repr__(self):
         return "<ZwoNode %s %r children=%d>" % (self.tag, self.name, len(self.children))
+
+
+def node_bind_matrix(node, endian="<"):
+    """Return the inverse bind matrix of a ``ZBON`` node as a 4x4 row tuple.
+
+    A skinned bone stores its inverse bind matrix as the last 48 bytes of a
+    109 byte tail (3x4 row-major floats plus an implicit ``0 0 0 1`` row).  The
+    matrix maps mesh space to bone space, so ``bind @ world`` is constant for
+    every bone of a rig and equals the inverse of the mesh transform the engine
+    applies to the vertices.
+
+    Nodes with any other tail length (maps contain 122 byte tails carrying
+    extra properties such as ``CastShadows``) have no bind matrix and return
+    ``None``.
+    """
+    tail = node.tail or b""
+    if len(tail) != BIND_TAIL_LEN:
+        return None
+    values = struct.unpack_from(endian + "12f", tail, BIND_MATRIX_OFFSET)
+    return (tuple(values[0:4]), tuple(values[4:8]), tuple(values[8:12]),
+            (0.0, 0.0, 0.0, 1.0))
+
+
+def rigid_bind_matrix(node, endian="<", tolerance=RIGID_BIND_TOLERANCE):
+    """Return the mesh-to-node matrix of a rigid ``ZENT`` part, or ``None``.
+
+    Rigid pieces of a rig (the flyer's wing membranes) hang from a plain
+    ``ZENT`` node whose 81 byte tail starts with a 3x4 row-major matrix.  The
+    mesh vertices are stored in the *part's* space, so ``world @ matrix`` puts
+    them where the engine draws them; without it both membranes of the flyer
+    land on the same side and one floats away from its bone.
+
+    The same 81 byte tail shows up on props and FX, where the numbers are not a
+    mesh bind at all (they move decals around, turn a vertical particle strip
+    horizontal).  Only a clean rigid transform -- orthonormal 3x3, positive
+    determinant, finite -- is accepted here; the importer also restricts the
+    correction to rigid meshes that hang below a ``ZBON`` node.
+    """
+    tail = node.tail or b""
+    if len(tail) != RIGID_TAIL_LEN:
+        return None
+    values = struct.unpack_from(endian + "12f", tail, 0)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    rows = (values[0:3], values[4:7], values[8:11])
+    for row in rows:
+        if abs(math.sqrt(sum(value * value for value in row)) - 1.0) > tolerance:
+            return None
+    for left in range(3):
+        for right in range(left + 1, 3):
+            dot = sum(rows[left][axis] * rows[right][axis] for axis in range(3))
+            if abs(dot) > tolerance:
+                return None
+    determinant = (
+        rows[0][0] * (rows[1][1] * rows[2][2] - rows[1][2] * rows[2][1])
+        - rows[0][1] * (rows[1][0] * rows[2][2] - rows[1][2] * rows[2][0])
+        + rows[0][2] * (rows[1][0] * rows[2][1] - rows[1][1] * rows[2][0]))
+    if determinant <= 0.0:
+        return None
+    return (tuple(values[0:4]), tuple(values[4:8]), tuple(values[8:12]),
+            (0.0, 0.0, 0.0, 1.0))
 
 
 class ZwoFile:

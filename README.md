@@ -51,8 +51,82 @@ animations have not been verified because no PS3 `.ani` files were available.
   call stores `CRC32(material path)`, so each face range gets the material the
   game really uses. Meshes split across several draw calls get several material
   slots (1,230 meshes in the shipped PC data are multi-material).
-* Skinned characters get an armature whose rest bones exactly match the scene
-  node world matrices, and vertex groups are built from the `.geo` weights.
+* Skinned characters get an armature whose rest bones match the scene node
+  world matrices (or the bind data, for the few posed rigs described below),
+  and vertex groups are built from the `.geo` weights.
+  A `.zwo` bone runs along the node's local **+X** while Blender bones run along
+  **+Y**, so the rest matrix includes a fixed −90° roll; without it every rig's
+  bones stuck out sideways, ~90° away from the limbs they belong to.
+* Every skinned `ZBON` tail ends with a 3×4 **inverse bind matrix**
+  (`bind = (M · world)⁻¹`, the last 48 bytes of the 109-byte tail). `M` is the
+  constant transform between the skeleton's node space and the mesh, so the
+  importer applies it to the **armature object** instead of guessing a yaw.
+  For the flyer family that is `Rz(−90°)` **plus** a translation
+  `(0, 0.157, −0.069)`, and for `joe` a translation
+  `(0.048, 0.073, 0.021)`; the old yaw-only fit ignored the translation and
+  left every bone ~0.17 units off the body (forearms, hands and stings ended
+  up outside the mesh). Rigid parts (the wings) receive the same transform, and
+  the exporter undoes it before writing node transforms, so the files still
+  round-trip byte-for-byte.
+* A few rigs keep a **posed** node tree instead of the bind pose: their nodes
+  carry their own scale (0.78–1.10) and rotation, so the per-bone implied `M`
+  disagrees and no single object transform can line the skeleton up with the
+  mesh - the bones end up rotated and floating beside the body (`fatwilly`,
+  `scientist`, `nathan`; spread 0.14–1.89 against the 0.005 tolerance). For
+  those the armature is built from the bind data instead: `bind⁻¹` is exactly
+  the rest matrix of the bone in mesh space, so every joint lands back inside
+  the character (`fatwilly` 10/28 → 24/25 bones inside the skin, `scientist`
+  13/30 → 28/30). Animations then take the rest product from the bone itself
+  instead of the node chain.
+* If a rig has no bind tails, the bind data is not rigid, or the per-bone
+  matrices already agree (spread ≤ 0.02), the importer falls back to the old
+  strict yaw detector (2D Procrustes fit of bone heads to weighted vertex
+  centroids: ≥6 bones, |yaw| 85–95°, residual < 0.3). Two shipped rigs
+  (`puck_blob`, `spit_blob`) only need the `Rz(−90°)` rotation.
+* Bone **tails** follow the first child bone only when that child sits on the
+  bone's own axis (within 45°); otherwise the bone keeps a short stub. Some
+  rigs hang a branch (a mouth, a second arm, a thigh) far to the side of its
+  parent, and using that distance used to spear a long bone straight out of the
+  head or the neck. Bones with no child to measure (the last bone of a finger,
+  claw, toe or wing) have no length in the file either, so the fallback is a
+  fixed 0.12 - much longer than the spitter's claws, which left the tips poking
+  through the hand. Once the meshes exist those tails are clipped to the last
+  point that is no further outside the skin than the head already is, so a tail
+  never spears out of the character. Tails are display-only: rest matrices,
+  weights and the exported data are unaffected.
+* Bones that no vertex uses are marked non-deforming and moved to a hidden
+  **`Helpers (no weights)`** bone collection; bones that do deform stay in
+  **`Deform`**. `spitter`, for example, shares `jumper`'s four-armed skeleton
+  but its `.geo` only weights two arms, so the second pair would otherwise
+  float around the body. Root bones stay visible because they are the handle
+  for moving the whole character. Enable the collection in the armature
+  properties to show them again.
+* Alternative versions of one part are parked in a hidden **`Alternates
+  (hidden)`** collection instead of overlapping each other. `holga` ships two
+  faces, `holga_head` (neutral, 228 vertices) and `holga_headangry` (screaming,
+  393 vertices), both rigidly bound to `JoeHead` and occupying the same space;
+  the game swaps them to change her expression, so importing both makes the
+  face z-fight and read as a broken texture. Parts that are rigidly bound to
+  the *same* single bone, share a name prefix and overlap by at least 90% of
+  the smaller bounding box are treated as variants: the shortest name stays
+  visible and the others move to the hidden collection, which can be enabled
+  in the outliner. Hidden variants are still part of the export set, so a
+  no-op export keeps every mesh.
+* Rigid parts of a transformed rig (the flyer's wings) are placed with the same
+  mesh transform as the bones, so they stay attached to the skinned body; when
+  an `.ani` is imported their animated node matrices are multiplied by that
+  transform again.
+* A rigid part of a rig also stores its own **mesh-to-node matrix** in the first
+  48 bytes of the 81-byte `ZENT` tail. The membranes of `flyer` and
+  `flyer_catcher` need it: their geometry is authored in part space, so without
+  it both membranes land on the same side of the body and the left one floats
+  0.23 units off its bone. The importer places those parts at
+  `M · world · bind` and the exporter divides it back out, so a no-op export is
+  still byte-identical. The same 81-byte tail appears on props and FX
+  (`blood_puddle`, `poison_zone`, `blender`, …) where the numbers are *not* a
+  mesh bind — they move decals or turn a particle strip horizontal — so the
+  matrix is only used for a rigid mesh below a `ZBON` node, and only when it is
+  a clean orthonormal transform with a positive determinant.
 * Textures are decoded to temporary DDS files and hooked into Principled BSDF
   materials. Every `.hvt` format in the shipped data is supported (DXT1, DXT3,
   DXT5 and the uncompressed ARGB/XRGB variants).
@@ -71,6 +145,14 @@ animations have not been verified because no PS3 `.ani` files were available.
 * `usealpha` / `alpha` are treated as a **cut-out** mask (alpha thresholded and
   dithered) instead of smooth transparency, so characters such as Cassy no
   longer look washed out. Only `opacity < 1` or `additive` keep real blending.
+* Backface culling follows the `twosided` flag. The `.geo` writes `twosided`
+  only when it is false, meaning the material culls its back faces; when the
+  key is absent the material is two-sided (461 materials carry the flag, 4,631
+  omit it). Blender draws both sides by default, which exposed the inside of
+  one-sided shells: the schoolkids' hair showed the blood decal its inner faces
+  point at, and the duplicate inner layer z-fought with the outer hair. The
+  importer now enables `use_backface_culling` when the flag is present, so the
+  hair is clean; it is display-only and never touches the exported bytes.
 * Export writes edits back into the original byte stream: untouched files
   round-trip byte-for-byte, changed meshes are rebuilt, and everything else
   (unknown tails, opaque records, checksums) is preserved verbatim.
@@ -93,7 +175,7 @@ look are mapped like this:
 | `glossiness` / `specularmultiplier` | Roughness / Specular |
 | `usealpha` / `alpha` | cut-out alpha (thresholded, dithered) |
 | `opacity` / `additive` | smooth alpha blending |
-| `twosided` | backface culling off |
+| `twosided` (only written as `False`) | backface culling on; absent means two-sided |
 
 Characters usually have one material and one texture; the per-part colours
 (skin, backpack, uniform) come from the vertex colours stored in the `.geo`,
@@ -194,7 +276,10 @@ loaded in the scene.
 * Node targets are resolved with `CRC32(animation_path + "/" + node_name.lower())`,
   which was verified against the shipped assets.
 * Bone animation is baked to pose-bone `matrix_basis` values, so it renders
-  correctly regardless of edit-bone orientation.
+  correctly regardless of edit-bone orientation. The basis is conjugated by the
+  same −90° bone-axis roll that the rest uses, so the deformation
+  (`pose @ rest⁻¹`) is bit-for-bit what the engine would produce (verified to
+  3·10⁻⁵ on `jumper`), and the −90° rest roll is purely visual.
 * Skinned meshes are driven by the armature only; their object transform is
   left untouched to avoid double deformation.
 * Camera/prop clips become object-level location/rotation/scale curves sampled

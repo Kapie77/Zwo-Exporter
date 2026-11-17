@@ -15,7 +15,7 @@ import tempfile
 import bpy
 from mathutils import Matrix, Quaternion, Vector
 
-from .zwo import ZwoFile
+from .zwo import ZwoFile, node_bind_matrix, rigid_bind_matrix
 from .geo import GeoFile
 from .hvt import load_hvt, texture_path_for_asset
 from .ani import load_ani, track_hash
@@ -30,6 +30,65 @@ MESH_NODE_TAGS = ("ZENT", "ZSKI")
 _BONE_SUFFIX = "_zwo_bone"
 #: Name of the colour attribute that receives the `.geo` per-vertex tint.
 VERTEX_COLOUR_LAYER = "zwo_color"
+
+#: Bones in a `.zwo` run along the scene node's local **+X** (a bone's children
+#: sit on that axis), while Blender bones run along their local **+Y**.  The
+#: rest matrix therefore needs this fixed roll so the bone follows the limb
+#: instead of sticking out sideways.  The animation importer applies the same
+#: rotation to the keys, which keeps the deformation identical (a rest frame
+#: change alone would twist the mesh once posed).
+BONE_AXIS = Matrix.Rotation(-math.pi / 2.0, 4, "Z")
+BONE_AXIS_INV = BONE_AXIS.inverted()
+
+#: Length used when a bone cannot reach a child along its own axis (leaf bones
+#: and branch children).  Blender bones are drawn head-to-tail, so a bone that
+#: follows an off-axis child would visibly spear out of the mesh.
+DEFAULT_BONE_LENGTH = 0.12
+
+#: A bone that had to fall back to ``DEFAULT_BONE_LENGTH`` has no length data of
+#: its own, and that constant is far longer than short features such as the
+#: spitter's claws or the flyer's wing fingers.  ``_fit_leaf_bones`` clips those
+#: tails to the mesh so the rig does not look broken.
+LEAF_BONE_SAMPLES = 24
+LEAF_BONE_MIN_LENGTH = 0.02
+LEAF_BONE_MARGIN = 0.005
+
+#: Some rigs are authored with the `.geo` mesh yawed 90 degrees around Z
+#: relative to the `.zwo` skeleton (the flyer family).  The detector below is
+#: deliberately strict: only a clean, well populated fit is corrected, so
+#: symmetric props and characters whose skeleton is merely in a different pose
+#: are left alone.
+FRAME_FIT_MIN_BONES = 6
+FRAME_FIT_ANGLE = (85.0, 95.0)
+FRAME_FIT_BASELINE = 0.3
+FRAME_FIT_RESIDUAL = 0.3
+
+
+def _flatten_matrix(matrix):
+    return [value for row in matrix for value in row]
+
+
+def _unflatten_matrix(values):
+    return Matrix(tuple(tuple(values[row * 4:(row + 1) * 4])
+                        for row in range(4)))
+
+
+def _mesh_frame_world(obj, world, frame):
+    """Carry a rigid node's animated world matrix into the mesh frame.
+
+    The importer places rigid parts (the flyer's wings) at
+    ``frame @ world @ bind`` so they sit on the mesh, where ``bind`` is the
+    mesh-to-node matrix from the node's tail.  The armature object uses the same
+    ``frame``.  The animation stores node-space matrices, so the same
+    multiplication restores the placement the engine uses at every key time.
+    Skinned parts are handled by the armature modifier and never reach here.
+    """
+    bind = obj.get("zwo_rigid_bind") if obj is not None else None
+    if bind:
+        world = world @ _unflatten_matrix(bind)
+    if frame is None:
+        return world
+    return frame @ world
 
 
 # ----------------------------------------------------------------- helpers
@@ -88,6 +147,27 @@ def _walk_with_matrices(nodes, parent_matrix):
 
 def _mesh_nodes(zwo):
     return [node for node in zwo.walk() if node.tag in MESH_NODE_TAGS]
+
+
+def _under_skeleton(zwo):
+    """Return the source indices of every node that hangs below a ``ZBON``.
+
+    A rigid part of a rig (the flyer's wing membranes) stores a mesh bind in the
+    first 48 bytes of its ``ZENT`` tail.  Props and FX carry an 81 byte tail too,
+    but there the numbers re-place decals or stretch particle strips instead of
+    binding a mesh, so only parts that belong to a rig get the correction.
+    """
+    below = set()
+
+    def walk(nodes, inside):
+        for node in nodes:
+            rigged = inside or node.tag == "ZBON"
+            if rigged:
+                below.add(node.source_index)
+            walk(node.children, rigged)
+
+    walk(zwo.children, False)
+    return below
 
 
 def _associate(meshes, nodes):
@@ -180,8 +260,15 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
             bsdf.inputs["Specular IOR Level"].default_value = max(0.0, min(1.0, float(value)))
     bsdf.inputs["Metallic"].default_value = 0.0
 
-    if props.get("twosided"):
-        material.use_backface_culling = False
+    # `twosided` is only written when a material is *not* two-sided, so its
+    # presence with a false value means the game culls the back faces.  Blender
+    # renders both sides by default, which exposes the inside of one-sided
+    # shells: the schoolkids' hair shows the blood decal its inner faces point
+    # at, and the extra layer z-fights with the outer hair.  Absent means the
+    # material is two-sided, so culling stays off.
+    twosided = props.get("twosided")
+    if twosided is not None:
+        material.use_backface_culling = not twosided
 
     # Characters use "usealpha" as a cut-out mask (hair, nets, straps), not as
     # smooth transparency: blending the whole material makes the model look
@@ -524,11 +611,222 @@ def _build_mesh_object(mesh, node, matrix, collection, asset_root, options, repo
     return obj
 
 
-def _build_armature(zwo, nodes_with_matrices, collection, report):
+def _bone_centroids(geo):
+    """Weighted vertex centroid of every bone referenced by the `.geo` meshes."""
+    centroids = {}
+    for mesh in geo.meshes:
+        names = [name.rsplit("/", 1)[-1].lower()
+                 for name in (mesh.bone_names or [])]
+        if not names:
+            continue
+        for index, position in enumerate(mesh.positions):
+            if index >= len(mesh.bone_weights) or index >= len(mesh.bone_indices):
+                continue
+            weights = mesh.bone_weights[index]
+            indices = mesh.bone_indices[index]
+            for slot in range(min(len(weights), len(indices))):
+                weight = weights[slot]
+                if weight <= 1e-4:
+                    continue
+                bone_index = indices[slot]
+                if bone_index >= len(names):
+                    continue
+                entry = centroids.setdefault(names[bone_index],
+                                             [Vector((0.0, 0.0, 0.0)), 0.0])
+                entry[0] += Vector(position) * weight
+                entry[1] += weight
+    return {name: total / weight
+            for name, (total, weight) in centroids.items() if weight > 1e-4}
+
+
+#: Maximum spread allowed between the per-bone implied mesh transforms.  Rigs
+#: whose bones disagree (a non-rigid bind, or bind data left over from another
+#: mesh) are left to the yaw fit instead of being placed from bad data.
+BIND_FRAME_TOLERANCE = 5e-3
+
+#: How far the per-bone implied mesh transform has to disagree before the node
+#: tree is treated as "not the bind pose" and the bones are rebuilt from the
+#: bind matrices instead.  Rigs that are a centimetre or two out are left alone;
+#: the node tree is still the better description of their rest pose.
+BIND_POSE_MIN_SPREAD = 2e-2
+
+
+def _implied_spread(matrices):
+    """Largest deviation of a set of 4x4 matrices from their average."""
+    average = [[0.0] * 4 for _ in range(4)]
+    for matrix in matrices:
+        for row in range(4):
+            for column in range(4):
+                average[row][column] += matrix[row][column] / len(matrices)
+    spread = 0.0
+    for matrix in matrices:
+        for row in range(3):
+            for column in range(4):
+                spread = max(spread, abs(matrix[row][column] - average[row][column]))
+    return spread
+
+
+def _bind_frame(zwo, nodes):
+    """Return the affine mesh transform implied by the bones' bind matrices.
+
+    Every skinned ``ZBON`` stores ``bind = (M @ world) ** -1``.  Solving for
+    ``M`` gives the transform that maps the skeleton's node space onto the mesh
+    and it is the same for every bone of a well formed rig.  The armature
+    *object* gets ``M``, so the bones sit exactly where the engine puts them -
+    including the translation that a pure yaw fit cannot recover - while the
+    mesh vertices stay untouched and export byte for byte.
+
+    Returns ``None`` when there is no bind data, when the bones disagree, when
+    the result is not a rigid transform, or when it is the identity.
+    """
+    implied = []
+    for node, world in nodes:
+        if node.tag != "ZBON":
+            continue
+        bind = node_bind_matrix(node, zwo.endian)
+        if bind is None:
+            continue
+        try:
+            implied.append(Matrix(bind).inverted() @ world.inverted())
+        except ValueError:
+            continue
+    if len(implied) < 2:
+        return None
+
+    if _implied_spread(implied) > BIND_FRAME_TOLERANCE:
+        return None
+
+    average = [[0.0] * 4 for _ in range(4)]
+    for matrix in implied:
+        for row in range(4):
+            for column in range(4):
+                average[row][column] += matrix[row][column] / len(implied)
+    average = Matrix(average)
+    basis = average.to_3x3()
+    identity = Matrix.Identity(3)
+    orthonormal = basis @ basis.transposed()
+    error = max(abs(orthonormal[row][column] - identity[row][column])
+                for row in range(3) for column in range(3))
+    if error > 1e-2 or basis.determinant() <= 0.0:
+        return None
+
+    rotation_error = max(abs(basis[row][column] - identity[row][column])
+                         for row in range(3) for column in range(3))
+    if rotation_error < 1e-4 and average.to_translation().length < 1e-4:
+        return None
+    return average
+
+
+def _bind_pose(zwo, nodes):
+    """Return per-bone rest matrices taken straight from the bind data.
+
+    Most rigs store their rest pose in the node tree, so ``bind = (M @ world)** -1``
+    only differs from ``world** -1`` by the constant mesh frame ``M`` and moving the
+    armature object is enough.  A few (``fatwilly``, ``scientist``, ``nathan``)
+    keep a *posed* node tree instead: the nodes carry their own scale and
+    rotation, the per-bone implied ``M`` disagrees, and no single object
+    transform can line the skeleton up with the mesh - the bones end up rotated
+    and floating beside the body.
+
+    The bind matrices themselves are still a clean rigid set, and ``bind** -1`` is
+    exactly the bone rest matrix in mesh space (skinning is
+    ``v' = world @ bind @ v``, so at rest ``world = bind** -1``).  Building the
+    armature from those puts every bone back inside the character.
+
+    Returns ``None`` when the bind data is missing or not rigid, or when the
+    node tree already *is* the bind pose (up to ``BIND_POSE_MIN_SPREAD``).
+    """
+    rest = {}
+    implied = []
+    for node, world in nodes:
+        if node.tag != "ZBON":
+            continue
+        bind = node_bind_matrix(node, zwo.endian)
+        if bind is None:
+            return None
+        matrix = Matrix(bind)
+        basis = matrix.to_3x3()
+        if basis.determinant() <= 0.0:
+            return None
+        orthonormal = basis @ basis.transposed()
+        error = max(abs(orthonormal[row][column] - (1.0 if row == column else 0.0))
+                    for row in range(3) for column in range(3))
+        if error > 1e-2:
+            return None
+        inverse = matrix.inverted()
+        rest[node.source_index] = inverse
+        implied.append(inverse @ world.inverted())
+    if len(rest) < 2:
+        return None
+    if _implied_spread(implied) <= BIND_POSE_MIN_SPREAD:
+        return None
+    return rest
+
+
+def _frame_rotation(zwo, geo, nodes):
+    """Return the Z yaw that puts the skeleton onto the mesh, or ``None``.
+
+    The fit is a 2D Procrustes rotation of the bone heads onto the weighted
+    vertex centroids.  Rotating the armature *object* (never the vertices) keeps
+    the geometry byte identical for export while making the bones follow the
+    limbs.
+
+    This is only the fallback for rigs whose bind matrices are missing or
+    inconsistent (see :func:`_bind_frame`).
+    """
+    if geo is None or not geo.meshes:
+        return None
+    centroids = _bone_centroids(geo)
+    if not centroids:
+        return None
+    heads, targets = [], []
+    for node, matrix in nodes:
+        if node.tag != "ZBON":
+            continue
+        centroid = centroids.get(node.name.lower())
+        if centroid is None:
+            continue
+        heads.append(matrix.to_translation())
+        targets.append(centroid)
+    if len(heads) < FRAME_FIT_MIN_BONES:
+        return None
+
+    mean_head = sum(heads, Vector((0.0, 0.0, 0.0))) / len(heads)
+    mean_target = sum(targets, Vector((0.0, 0.0, 0.0))) / len(targets)
+    sine = 0.0
+    cosine = 0.0
+    for head, target in zip(heads, targets):
+        head_x, head_y = head.x - mean_head.x, head.y - mean_head.y
+        target_x, target_y = target.x - mean_target.x, target.y - mean_target.y
+        sine += head_x * target_y - head_y * target_x
+        cosine += head_x * target_x + head_y * target_y
+    angle = math.atan2(sine, cosine)
+    degrees = abs(math.degrees(angle))
+    if not FRAME_FIT_ANGLE[0] <= degrees <= FRAME_FIT_ANGLE[1]:
+        return None
+
+    rotation = Matrix.Rotation(angle, 4, "Z")
+    baseline = 0.0
+    residual = 0.0
+    for head, target in zip(heads, targets):
+        baseline += (head - target).length_squared
+        residual += ((rotation @ head) - target).length_squared
+    baseline = math.sqrt(baseline / len(heads))
+    residual = math.sqrt(residual / len(heads))
+    if baseline < FRAME_FIT_BASELINE or residual > FRAME_FIT_RESIDUAL:
+        return None
+    return rotation
+
+
+def _build_armature(zwo, nodes_with_matrices, collection, report, rest=None):
     bones = [node for node, _m in nodes_with_matrices if node.tag == "ZBON"]
     if not bones:
         return None, {}
     matrices = {node.source_index: matrix for node, matrix in nodes_with_matrices}
+    if rest is not None:
+        # Rigs whose node tree is not the bind pose get their rest matrices from
+        # the bind data instead (see _bind_pose).
+        matrices.update(rest)
 
     arm_data = bpy.data.armatures.new("zwo_armature")
     arm_obj = bpy.data.objects.new("zwo_armature", arm_data)
@@ -541,19 +839,28 @@ def _build_armature(zwo, nodes_with_matrices, collection, report):
     for node in bones:
         matrix = matrices[node.source_index]
         head = matrix.to_translation()
-        # The bone rest matrix must equal the scene node's world matrix: skinning
+        # The bone rest matrix must equal the scene node's world matrix (rotated
+        # so Blender's +Y bone axis follows the node's +X limb axis): skinning
         # and animation both deform relative to the bone rest, so a head/tail
         # approximation (with an arbitrary roll) would twist the mesh once posed.
         bone = arm_data.edit_bones.new(node.name)
         bone.head = head
         bone.tail = head + Vector((0.0, 0.1, 0.0))
-        bone.matrix = matrix
+        bone.matrix = matrix @ BONE_AXIS
         children = [c for c in node.children if c.tag == "ZBON"]
+        length = DEFAULT_BONE_LENGTH
         if children:
-            tail = matrices[children[0].source_index].to_translation()
-            length = (tail - head).length
-        else:
-            length = 0.12
+            offset = matrices[children[0].source_index].to_translation() - head
+            if offset.length > 1e-6:
+                # Follow the child only when it sits on the bone's own axis
+                # (within 45 degrees).  Branch children such as a mouth or a
+                # second arm hanging off the spine are far to the side, and
+                # their distance would spear the bone out through the skin.
+                axis = (matrix.to_3x3() @ Vector((1.0, 0.0, 0.0))).normalized()
+                along = offset.dot(axis)
+                lateral = (offset - axis * along).length
+                if along > 0.0 and lateral <= along:
+                    length = offset.length
         bone.length = max(0.02, min(length, 5.0))
         created[node.source_index] = bone
 
@@ -613,6 +920,235 @@ def _bind_vertex_groups(obj, mesh, arm_obj):
     obj.parent = arm_obj
     obj.matrix_parent_inverse = arm_obj.matrix_world.inverted()
     return bound
+
+
+def _tag_helper_bones(arm_obj, collection, report):
+    """Separate bones that deform the mesh from helper bones that do not.
+
+    Some rigs inherit bones the mesh never uses - ``spitter`` shares the
+    four-armed ``jumper`` skeleton, so its second pair of arms exists only as
+    bone data.  Those bones cannot move anything, so they are marked
+    non-deforming and parked in a hidden bone collection instead of floating
+    around the viewport.  Root bones stay visible because they are the handle
+    used to move the whole character.
+    """
+    weighted = set()
+    for obj in collection.objects:
+        if obj.type != "MESH" or not obj.vertex_groups:
+            continue
+        names = [group.name for group in obj.vertex_groups]
+        for vert in obj.data.vertices:
+            for group in vert.groups:
+                if group.weight > 1e-4:
+                    weighted.add(names[group.group])
+    bones = list(arm_obj.data.bones)
+    if not bones or not weighted:
+        return
+    helpers = [bone for bone in bones
+               if bone.name not in weighted and bone.parent is not None]
+    helper_names = {bone.name for bone in helpers}
+    for bone in bones:
+        if bone.name not in weighted:
+            bone.use_deform = False
+    report["helper_bones"] = len(helpers)
+    if not helpers:
+        return
+    deform = arm_obj.data.collections.new("Deform")
+    hidden = arm_obj.data.collections.new("Helpers (no weights)")
+    for bone in bones:
+        if bone.name in helper_names:
+            hidden.assign(bone)
+        else:
+            deform.assign(bone)
+    hidden.is_visible = False
+
+
+def _rigid_bone(mesh):
+    """Return the single bone that moves every vertex of ``mesh``, or ``None``."""
+    if not mesh.bone_weights:
+        return None
+    used = set()
+    for indices, weights in zip(mesh.bone_indices, mesh.bone_weights):
+        for index, weight in zip(indices, weights):
+            if weight > 1e-4:
+                used.add(index)
+    if len(used) != 1:
+        return None
+    index = used.pop()
+    if not (0 <= index < len(mesh.bone_names)):
+        return None
+    return mesh.bone_names[index].replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _world_bounds(obj):
+    lo = [1e18, 1e18, 1e18]
+    hi = [-1e18, -1e18, -1e18]
+    matrix = obj.matrix_world
+    for vert in obj.data.vertices:
+        point = matrix @ vert.co
+        for axis in range(3):
+            lo[axis] = min(lo[axis], point[axis])
+            hi[axis] = max(hi[axis], point[axis])
+    return lo, hi
+
+
+def _bounds_overlap(first, second):
+    """Fraction of the smaller box that the two boxes share."""
+    lo_a, hi_a = first
+    lo_b, hi_b = second
+    volume = 1.0
+    volume_a = 1.0
+    volume_b = 1.0
+    for axis in range(3):
+        depth = min(hi_a[axis], hi_b[axis]) - max(lo_a[axis], lo_b[axis])
+        volume *= max(0.0, depth)
+        volume_a *= max(1e-9, hi_a[axis] - lo_a[axis])
+        volume_b *= max(1e-9, hi_b[axis] - lo_b[axis])
+    return volume / min(volume_a, volume_b)
+
+
+#: How much of the smaller mesh has to sit inside the other one before two
+#: rigid parts are treated as alternative versions of the same part.
+ALTERNATE_OVERLAP = 0.9
+
+
+def _tag_alternate_meshes(built, collection, report):
+    """Park alternate variants of a part in a hidden collection.
+
+    ``holga`` ships two faces - ``holga_head`` and ``holga_headangry`` - that
+    are rigidly bound to the same head bone and occupy the same space; the game
+    swaps them to change her expression.  Importing both makes them z-fight, so
+    the face reads as a broken texture.  The shortest name stays visible (the
+    base variant) and the others go to ``Alternates (hidden)``, which can be
+    enabled in the outliner to look at the other expression.
+
+    Only parts that are rigidly bound to the *same* single bone, share a name
+    prefix and overlap almost completely qualify, so unrelated meshes that
+    happen to share a name are left alone.
+    """
+    groups = {}
+    for obj, mesh, node in built:
+        if node is None or not obj.vertex_groups:
+            continue
+        bone = _rigid_bone(mesh)
+        if bone is None:
+            continue
+        groups.setdefault(bone, []).append(obj)
+    hidden = []
+    for objects in groups.values():
+        if len(objects) < 2:
+            continue
+        bounds = {}
+        for index, obj in enumerate(objects):
+            for other in objects[index + 1:]:
+                if not (obj.name.startswith(other.name)
+                        or other.name.startswith(obj.name)):
+                    continue
+                if obj not in bounds:
+                    bounds[obj] = _world_bounds(obj)
+                if other not in bounds:
+                    bounds[other] = _world_bounds(other)
+                if _bounds_overlap(bounds[obj], bounds[other]) < ALTERNATE_OVERLAP:
+                    continue
+                longer = obj if len(obj.name) > len(other.name) else other
+                if longer not in hidden:
+                    hidden.append(longer)
+    if not hidden:
+        return
+    parked = bpy.data.collections.new("Alternates (hidden)")
+    collection.children.link(parked)
+    parked.hide_viewport = True
+    parked.hide_render = True
+    for obj in hidden:
+        for owner in list(obj.users_collection):
+            owner.objects.unlink(obj)
+        parked.objects.link(obj)
+    report["alternate_meshes"] = [obj.name for obj in hidden]
+
+
+def _surface_offset(trees, point):
+    """Signed distance from ``point`` to the nearest of ``trees``.
+
+    Positive values are outside the mesh, negative inside.  When several meshes
+    overlap (a body plus rigid wing pieces) the nearest surface wins.
+    """
+    best = None
+    for tree in trees:
+        location, normal, _index, distance = tree.find_nearest(point)
+        if location is None:
+            continue
+        signed = -distance if (point - location).dot(normal) < 0.0 else distance
+        if best is None or abs(signed) < abs(best):
+            best = signed
+    return best
+
+
+def _fit_leaf_bones(arm_obj, collection, report):
+    """Shorten bones whose length came from ``DEFAULT_BONE_LENGTH``.
+
+    Leaf bones and bones whose only children sit off their own axis have no
+    length data in the file, so ``_build_armature`` gives them a fixed 0.12.
+    On short features - the spitter's claws, a toe - that is longer than the
+    limb itself, so the drawn tail pokes through the skin and the rig reads as
+    misplaced even though the head and direction are right.
+
+    A bone's length only affects how Blender draws it (deformation uses the
+    rest matrix), so the tail is clipped to the last sample that is no further
+    outside the mesh than the head already is.  Bones whose length came from a
+    real child position are left untouched.
+    """
+    from mathutils.bvhtree import BVHTree
+
+    trees = []
+    for obj in collection.objects:
+        if obj.type != "MESH" or not obj.data.polygons or not obj.data.vertices:
+            continue
+        verts = [obj.matrix_world @ vertex.co for vertex in obj.data.vertices]
+        polys = [tuple(poly.vertices) for poly in obj.data.polygons]
+        trees.append(BVHTree.FromPolygons(verts, polys))
+    if not trees:
+        report["shortened_bones"] = 0
+        return
+
+    world = arm_obj.matrix_world
+    targets = []
+    for bone in arm_obj.data.bones:
+        if not bone.use_deform or bone.parent is None:
+            continue
+        head = world @ bone.head_local
+        tail = world @ bone.tail_local
+        offset = tail - head
+        length = offset.length
+        if abs(length - DEFAULT_BONE_LENGTH) > 1e-4:
+            continue
+        axis = offset / length
+        limit = max(_surface_offset(trees, head), 0.0) + LEAF_BONE_MARGIN
+        if _surface_offset(trees, tail) <= limit:
+            # The tail already sits on (or inside) the skin; only tails that
+            # spear out are wrong.  Checking the tail first also keeps bones
+            # that legitimately cross a cavity (mouth, eye socket) untouched.
+            continue
+        reach = 0.0
+        for step in range(1, LEAF_BONE_SAMPLES + 1):
+            distance = length * step / LEAF_BONE_SAMPLES
+            if _surface_offset(trees, head + axis * distance) > limit:
+                break
+            reach = distance
+        if reach >= length - 1e-4:
+            continue
+        new_length = max(LEAF_BONE_MIN_LENGTH, reach)
+        if new_length < length - 1e-4:
+            targets.append((bone.name, new_length))
+    if not targets:
+        report["shortened_bones"] = 0
+        return
+
+    bpy.context.view_layer.objects.active = arm_obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    for name, length in targets:
+        arm_obj.data.edit_bones[name].length = length
+    bpy.ops.object.mode_set(mode="OBJECT")
+    report["shortened_bones"] = len(targets)
 
 
 # ---------------------------------------------------------------- animation
@@ -835,6 +1371,13 @@ def import_animation(context, ani_path, armature=None, options=None):
     samplers, chains, bone_node, node_by_name, parent_of = animation_targets(
         ani, armature, zwo)
 
+    # Rigid parts of a yawed rig have to be carried into the mesh frame too.
+    frame = None
+    if armature is not None:
+        stored = armature.get("zwo_frame_rotation")
+        if stored:
+            frame = _unflatten_matrix(stored)
+
     # Non-skinned objects (props, foliage, cameras, lights) follow the same
     # tracks: their world matrix is rebuilt from the animated node chain.
     object_targets = []
@@ -887,10 +1430,27 @@ def import_animation(context, ani_path, armature=None, options=None):
         if not usable:
             continue
 
-        rest = bone.matrix_local
-        if bone.parent is not None:
-            rest = bone.parent.matrix_local.inverted() @ bone.matrix_local
-        inverted = rest.inverted()
+        # The chain product at bind time is exactly the un-rotated rest of the
+        # bone relative to its parent bone (the parent bone's node is excluded
+        # from the chain).  Using it instead of ``bone.matrix_local`` avoids a
+        # special case for the root, whose rest is ``world @ BONE_AXIS`` rather
+        # than ``BONE_AXIS^-1 @ world @ BONE_AXIS``.
+        #
+        # When the armature was built from the bind matrices instead of the node
+        # tree (``zwo_bind_pose``), the node product is *not* the rest the bones
+        # were created with, so the equivalent is taken from the rest itself.
+        if armature.get("zwo_bind_pose"):
+            rest_world = bone.matrix_local @ BONE_AXIS_INV
+            if bone.parent is not None:
+                parent_world = bone.parent.matrix_local @ BONE_AXIS_INV
+                bind = parent_world.inverted() @ rest_world
+            else:
+                bind = rest_world
+        else:
+            bind = Matrix.Identity(4)
+            for node in chain:
+                bind = bind @ Matrix(node.matrix())
+        inverted = bind.inverted()
 
         locations, rotations, scales = [], [], []
         for time in samples:
@@ -903,7 +1463,9 @@ def import_animation(context, ani_path, armature=None, options=None):
                 if local is None:
                     local = Matrix(node.matrix())
                 matrix = matrix @ local
-            basis = inverted @ matrix
+            # Conjugating by BONE_AXIS keeps the deformation ``pose @ rest^-1``
+            # identical to the engine's while the bone's +Y follows the limb.
+            basis = BONE_AXIS_INV @ (inverted @ matrix) @ BONE_AXIS
             location, rotation, scale = basis.decompose()
             rotations.append((rotation.w, rotation.x, rotation.y, rotation.z))
             locations.append((location.x, location.y, location.z))
@@ -944,6 +1506,7 @@ def import_animation(context, ani_path, armature=None, options=None):
                 if sampler is not None:
                     local = sampler.matrix(time, node.position, node.scale)
                 world = world @ (local if local is not None else Matrix(node.matrix()))
+            world = _mesh_frame_world(obj, world, frame)
             location, rotation, scale = world.decompose()
             rotations.append((rotation.w, rotation.x, rotation.y, rotation.z))
             locations.append((location.x, location.y, location.z))
@@ -1012,7 +1575,7 @@ def import_asset(context, zwo_path, options=None):
     report = {
         "meshes": 0, "vertices": 0, "faces": 0, "skinned": 0, "bounds": 0,
         "missing_textures": set(), "bad_textures": set(), "geo": None,
-        "armature": None, "warnings": [],
+        "armature": None, "warnings": [], "helper_bones": 0,
     }
 
     base, _ext = os.path.splitext(zwo_path)
@@ -1049,10 +1612,31 @@ def import_asset(context, zwo_path, options=None):
     context.scene.collection.children.link(collection)
 
     nodes = list(_walk_with_matrices(zwo.children, Matrix.Identity(4)))
-    arm_obj, _bones = _build_armature(zwo, nodes, collection, report)
+    # The bones' bind matrices give the exact transform between the skeleton's
+    # node space and the mesh (a rotation for some rigs, a rotation plus a
+    # translation for the flyer family and joe).  Moving the armature object
+    # instead of the vertices keeps the `.geo` data untouched and puts every
+    # joint where the engine expects it.
+    frame = _bind_frame(zwo, nodes)
+    if frame is None:
+        # Fallback for rigs without usable bind data: a pure yaw fit.
+        frame = _frame_rotation(zwo, geo, nodes)
+    rest = None
+    if frame is None:
+        # Last resort: a rig whose node tree is a pose rather than the bind
+        # pose has no single object transform, so the bones are rebuilt from
+        # the bind matrices (fatwilly, scientist, nathan).
+        rest = _bind_pose(zwo, nodes)
+    arm_obj, _bones = _build_armature(zwo, nodes, collection, report, rest)
     if arm_obj is not None:
         arm_obj["zwo_file"] = zwo_path
+        if rest is not None:
+            arm_obj["zwo_bind_pose"] = True
+    if arm_obj is not None and frame is not None:
+        arm_obj.matrix_world = frame
+        arm_obj["zwo_frame_rotation"] = _flatten_matrix(frame)
     matrices = {node.source_index: matrix for node, matrix in nodes}
+    rigged = _under_skeleton(zwo)
 
     if geo is not None and geo.meshes:
         mesh_nodes = [node for node, _m in nodes if node.tag in MESH_NODE_TAGS]
@@ -1061,19 +1645,50 @@ def import_asset(context, zwo_path, options=None):
             report["warnings"].append(
                 "%d meshes instanced across %d nodes"
                 % (len(geo.meshes), len(pairs)))
+        built = []
         for mesh, node in pairs:
             matrix = matrices.get(node.source_index) if node else Matrix.Identity(4)
+            skinned = arm_obj is not None and bool(mesh.bone_weights)
+            bind = None
+            if not skinned and node is not None and node.source_index in rigged:
+                # Rigid parts of a rig store their mesh-to-node matrix in the
+                # node tail: without it both flyer membranes land on the same
+                # side and one floats away from its bone.
+                bind = rigid_bind_matrix(node, zwo.endian)
+                if bind is not None:
+                    matrix = matrix @ Matrix(bind)
+            if frame is not None and not skinned:
+                # Rigid parts (the flyer's wings) are authored in the same node
+                # space as the skeleton, so they follow the same mesh transform
+                # as the bones.  Skinned meshes stay in node space: the armature
+                # modifier already conjugates their deformation by ``frame``.
+                matrix = frame @ matrix
             obj = _build_mesh_object(mesh, node, matrix, collection,
                                      asset_root, options, report)
             obj["zwo_file"] = zwo_path
             obj["geo_file"] = geo_path
+            if bind is not None:
+                obj["zwo_rigid_bind"] = _flatten_matrix(Matrix(bind))
+            if frame is not None:
+                # Remember the unanimated placement so rigid parts (wings) can be
+                # carried into the mesh frame while the animation plays, and keep
+                # the frame so the exporter can undo it when writing the node.
+                obj["zwo_rest_world"] = _flatten_matrix(obj.matrix_world)
+                if not skinned:
+                    obj["zwo_frame"] = _flatten_matrix(frame)
             report["meshes"] += 1
             report["vertices"] += len(mesh.positions)
             report["faces"] += len(mesh.faces)
-            if arm_obj is not None and mesh.bone_weights:
+            if skinned:
                 _bind_vertex_groups(obj, mesh, arm_obj)
                 report["skinned"] += 1
+            built.append((obj, mesh, node))
         report["bounds"] = len(mesh_nodes)
+        _tag_alternate_meshes(built, collection, report)
+
+    if arm_obj is not None:
+        _tag_helper_bones(arm_obj, collection, report)
+        _fit_leaf_bones(arm_obj, collection, report)
 
     if options.get("lights", True):
         _build_lights(zwo, nodes, collection, report, zwo_path)
