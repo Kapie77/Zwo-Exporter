@@ -153,6 +153,21 @@ animations have not been verified because no PS3 `.ani` files were available.
   point at, and the duplicate inner layer z-fought with the outer hair. The
   importer now enables `use_backface_culling` when the flag is present, so the
   hair is clean; it is display-only and never touches the exported bytes.
+* Specular follows the shipped shaders: `SpecularColor × SpecularMultiplier ×
+  SpecularTexture`, gated by `UseSpecular`/`UseSpecularTexture`. The multiplier
+  becomes **Specular IOR Level**, a non-white `specularcolor` becomes **Specular
+  Tint**, and `speculartexture` is sampled as a Non-Color mask multiplied into
+  the level. That is what the weapons need: `9mm_spec`/`batte_spec` are white on
+  the metal and black on the grip, so the wooden and rubber parts stop being as
+  glossy as the slide. `crowbar`, `grenade` and `chainsaw`'s teeth point
+  `speculartexture` at their diffuse while `usespeculartexture` is `False`, so
+  the flag is what decides. `character.fx` declares no specular parameters at
+  all, and character materials carry `usespecular=False`, so they end up with no
+  specular term.
+* Cube-map reflections (`envmaptexture`/`useenvmap`, `env1`–`env7`) and the
+  runtime pickup glow (`glowtexture`) are not reproduced: the env maps are DDS
+  cube maps that the importer does not bind, and the glow ramp is driven by the
+  game, not by the weapon surface.
 * Export writes edits back into the original byte stream: untouched files
   round-trip byte-for-byte, changed meshes are rebuilt, and everything else
   (unknown tails, opaque records, checksums) is preserved verbatim.
@@ -172,7 +187,9 @@ look are mapped like this:
 | `.geo` vertex colour (characters) | `zwo_color` attribute, multiplied into Base Color |
 | `.geo` vertex colour red (monsters) | mask: Base Color = diffuse × red, Emission = ramp × (1 − red) |
 | `blobshadingtexture` | unlit facing ramp (monster green, boss red, ...) |
-| `glossiness` / `specularmultiplier` | Roughness / Specular |
+| `glossiness` | Roughness |
+| `specularmultiplier` + `speculartexture` + `specularcolor` | Specular IOR Level / Specular Tint |
+| `usespecular` / `usespeculartexture` | gates the specular term and its mask |
 | `usealpha` / `alpha` | cut-out alpha (thresholded, dithered) |
 | `opacity` / `additive` | smooth alpha blending |
 | `twosided` (only written as `False`) | backface culling on; absent means two-sided |

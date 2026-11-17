@@ -254,10 +254,33 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
         roughness = 1.0 - gloss if 0.0 <= gloss <= 1.0 \
             else (2.0 / (gloss + 2.0)) ** 0.5
         bsdf.inputs["Roughness"].default_value = max(0.02, min(1.0, roughness))
-    if "Specular IOR Level" in bsdf.inputs:
+
+    # The engine's Phong specular is
+    #     SpecularColor * SpecularMultiplier * SpecularTexture
+    # gated by `UseSpecular`, and the texture is only sampled when
+    # `UseSpecularTexture` is set.  Every shader that shades geometry this way
+    # (`collectable`, `main_static`, `main_dyn`, `decal`, `tree`, `monster`)
+    # declares those parameters; `character.fx` declares none, so characters
+    # have no specular term at all.  Blender's "Specular IOR Level" is the
+    # closest equivalent, and a specular mask is exactly what the weapons need:
+    # `9mm_spec` is white on the slide and black on the grip, so without it the
+    # wooden and rubber parts are as glossy as the metal.
+    specular_level = 0.5
+    if props.get("usespecular") is False:
+        specular_level = 0.0
+    else:
         value = props.get("specularmultiplier")
         if isinstance(value, (int, float)):
-            bsdf.inputs["Specular IOR Level"].default_value = max(0.0, min(1.0, float(value)))
+            specular_level = float(value)
+    specular_level = max(0.0, min(1.0, specular_level))
+    if "Specular IOR Level" in bsdf.inputs:
+        bsdf.inputs["Specular IOR Level"].default_value = specular_level
+        tint = props.get("specularcolor")
+        if isinstance(tint, (list, tuple)) and len(tint) >= 3 and all(
+                isinstance(c, (int, float)) for c in tint[:3]) and any(
+                    abs(float(c) - 1.0) > 0.02 for c in tint[:3]):
+            bsdf.inputs["Specular Tint"].default_value = (
+                float(tint[0]), float(tint[1]), float(tint[2]), 1.0)
     bsdf.inputs["Metallic"].default_value = 0.0
 
     # `twosided` is only written when a material is *not* two-sided, so its
@@ -294,6 +317,7 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
     base_socket = None
     alpha_socket = None
     vcol_socket = None
+    base_image = None
 
     # `.geo` vertex colours tint the atlas: the white/neutral parts of the
     # texture take their colour per vertex (backpack, skin, monster hide, ...).
@@ -333,6 +357,7 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
         if path:
             image = _load_texture(path, report)
             if image is not None:
+                base_image = image
                 tex = nodes.new("ShaderNodeTexImage")
                 tex.image = image
                 tex.location = (-520, 320)
@@ -471,6 +496,36 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
                 links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
         else:
             report["missing_textures"].add(normal_name)
+
+    # `speculartexture` is a per-pixel specular mask (white on metal, black on
+    # wood, rubber and cloth), scaled by `specularmultiplier`.  It is only read
+    # when `usespeculartexture` is set: `crowbar` and `grenade` keep the field
+    # pointing at their diffuse while the flag is false, and `chainsaw`'s teeth
+    # material does the same, so the flag is what decides.
+    spec_name = props.get("speculartexture")
+    if use_textures and spec_name and props.get("usespeculartexture") and \
+            specular_level > 0.0 and "Specular IOR Level" in bsdf.inputs:
+        path = texture_path_for_asset(spec_name, asset_root)
+        if path:
+            image = _load_texture(path, report)
+            if image is not None:
+                if image is base_image:
+                    # `magnum` reuses `magnum_diff` as its mask; a copy keeps
+                    # the Non-Color setting away from the base colour.
+                    image = image.copy()
+                image.colorspace_settings.name = "Non-Color"
+                tex = nodes.new("ShaderNodeTexImage")
+                tex.image = image
+                tex.location = (-620, -320)
+                gain = nodes.new("ShaderNodeMath")
+                gain.operation = "MULTIPLY"
+                gain.use_clamp = True
+                gain.location = (-320, -320)
+                gain.inputs[1].default_value = specular_level
+                links.new(tex.outputs["Color"], gain.inputs[0])
+                links.new(gain.outputs[0], bsdf.inputs["Specular IOR Level"])
+        else:
+            report["missing_textures"].add(spec_name)
     return material
 
 
