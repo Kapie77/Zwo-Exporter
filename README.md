@@ -116,17 +116,42 @@ animations have not been verified because no PS3 `.ani` files were available.
   mesh transform as the bones, so they stay attached to the skinned body; when
   an `.ani` is imported their animated node matrices are multiplied by that
   transform again.
-* A rigid part of a rig also stores its own **mesh-to-node matrix** in the first
-  48 bytes of the 81-byte `ZENT` tail. The membranes of `flyer` and
-  `flyer_catcher` need it: their geometry is authored in part space, so without
-  it both membranes land on the same side of the body and the left one floats
-  0.23 units off its bone. The importer places those parts at
-  `M · world · bind` and the exporter divides it back out, so a no-op export is
-  still byte-identical. The same 81-byte tail appears on props and FX
-  (`blood_puddle`, `poison_zone`, `blender`, …) where the numbers are *not* a
-  mesh bind — they move decals or turn a particle strip horizontal — so the
-  matrix is only used for a rigid mesh below a `ZBON` node, and only when it is
-  a clean orthonormal transform with a positive determinant.
+* Every rigid mesh node stores its own **mesh-to-node matrix** in the first
+  48 bytes of its tail (the tail length varies: 81 bytes on props, 104–133 on
+  the map nodes). Vertices are authored in the part's own pivot space, so the
+  importer places the object at `node_world · bind`; without it the cars of
+  `map_00_a` sink into the road, the flyer's membranes land on the same side
+  and a prop's parts drift apart (the basket's bottom sits 7 units below its
+  top). The matrix is used on every rigid mesh — skinned meshes keep the bone
+  data in their tail and are placed by the armature — and only when it is a
+  clean orthonormal transform with a positive determinant; a few FX tails carry
+  a stretched frame instead. 21,599 of the 21,752 nodes in the shipped maps
+  carry a valid matrix. The exporter divides it back out, so a no-op export is
+  still byte-identical.
+* **Placed copies share their geometry.** The level builder stores a model once
+  and writes a second, much smaller record for every further placement: it has
+  `0` where the block id goes, `CRC32(model path)` in the next slot, a running
+  record id, and only the per-placement lightmap UVs and the draw calls. Every
+  placement still owns a `ZENT` node, so a map that imports only the full
+  records loses more than half of its props — `map_00_a` had 249 of its 483
+  meshes (bins, barrels, cans, lamp posts, vents, cars, trees, foliage, decals),
+  `map_01_a` 132 of 273. The importer now resolves the hash against the mesh
+  table of the same `.geo` (10,388 instance records in the shipped data) and
+  reuses that geometry; the record's own `ZSEQ` still decides its material, so a
+  fog sheet can reuse another one's plane under `fogsheet_rays` while its source
+  uses `fogsheet_rays2`. Editing an instance's vertices in Blender is reported
+  as a warning instead of being written, because its record has nowhere to put
+  them — edit the source mesh instead. The record bytes are preserved, so a
+  no-op export stays byte-identical.
+* `diffusecolor` is the material **tint** the shaders multiply into the base
+  colour (`diffuse · texture · vertex colour`); `main_static`, `decal`,
+  `character` and `collectable` all declare the `DiffuseColor` constant. Level
+  art recolours one shared atlas with it: `road_marks` and `decals_diff` are
+  white and take their yellow/coloured look from the tint, the basket's and the
+  blender's `_onlycolordiffuse` bodies take their whole colour from it, and the
+  map's boundary plane (`black`) is `(0, 0, 0)` — without the tint it rendered
+  as a white wall across the level. A missing key means no tint; the 0.8 grey
+  parsed default is not a colour.
 * Textures are decoded to temporary DDS files and hooked into Principled BSDF
   materials. Every `.hvt` format in the shipped data is supported (DXT1, DXT3,
   DXT5 and the uncompressed ARGB/XRGB variants).
@@ -164,13 +189,34 @@ animations have not been verified because no PS3 `.ani` files were available.
   the flag is what decides. `character.fx` declares no specular parameters at
   all, and character materials carry `usespecular=False`, so they end up with no
   specular term.
-* Cube-map reflections (`envmaptexture`/`useenvmap`, `env1`–`env7`) and the
+* **Cube-map reflections (`envmaptexture`/`useenvmap`, `env1`–`env7`) and the
   runtime pickup glow (`glowtexture`) are not reproduced: the env maps are DDS
   cube maps that the importer does not bind, and the glow ramp is driven by the
   game, not by the weapon surface.
+* **Baked lightmaps are not applied.** Map materials carry
+  `lightmaptexturea` (e.g. `lm_map_00_a`) and the level is lit from it in the
+  game. The importer does not sample it, so maps are lit by Blender lights
+  instead and render brighter and flatter than the game. Geometry, materials
+  and placement are unaffected.
 * Export writes edits back into the original byte stream: untouched files
   round-trip byte-for-byte, changed meshes are rebuilt, and everything else
   (unknown tails, opaque records, checksums) is preserved verbatim.
+* **Sheared node placements survive a no-op export.** Blender keeps an object
+  transform as location/rotation/scale, so a node whose rigid `bind` matrix
+  lands under a non-uniformly scaled parent cannot hold its shear in
+  `matrix_basis`; the first depsgraph evaluation rebuilds `matrix_world` without
+  it (a few map doors shift by ~1e-2). The importer therefore records the
+  placement Blender really holds after the scene settles, and the exporter
+  compares against that: a node nobody moved keeps its original floats (shear
+  included), and only a real edit is written back. All 23 shipped `map_01`
+  chunks and `map_00_a` export byte-identically.
+* **Degenerate triangles do not trigger a rebuild.** A few map records contain a
+  zero-area triangle (a repeated vertex index, e.g. `(8, 9, 9)` in the
+  `shop06`/`shop07`/`shop08` of `map_01_n`). `mesh.validate()` drops it on
+  import, and the exporter ignores degenerate faces when deciding whether the
+  geometry changed, so the record keeps its bytes. If the mesh is edited for
+  real, the rebuilt record carries the reduced face count and the import warning
+  (`face count changed during import (13 -> 12)`) explains the difference.
 * A `.bak` copy of the original `.zwo`/`.geo` pair is created before the first
   overwrite.
 
@@ -182,7 +228,7 @@ look are mapped like this:
 | `.geo` property | Blender |
 | --------------- | ------- |
 | `diffusetexture` | Base Color texture |
-| `diffusecolor` | fallback Base Color |
+| `diffusecolor` | Base Color tint, multiplied with the texture and the vertex colour |
 | `normaltexture` + `normalmapboost` | Normal Map |
 | `.geo` vertex colour (characters) | `zwo_color` attribute, multiplied into Base Color |
 | `.geo` vertex colour red (monsters) | mask: Base Color = diffuse × red, Emission = ramp × (1 − red) |
@@ -326,11 +372,12 @@ Tested against the shipped PC data:
 * **Checksums are not recomputed.** `.geo` block checksums are not CRC32 and
   their algorithm is unknown, so they are preserved byte-for-byte. This is fine
   for untouched blocks; rebuilt geometry keeps the original checksum value.
-* **Materials are exact, with a small fallback.** Each `ZSEQ` draw call carries
+* **Materials are exact.** Each `ZSEQ` draw call carries
   `CRC32(material.path.lower())`, which is resolved against the `.geo` palette
   and assigned per face range. This reproduces the game's material layout on all
-  353 shipped `.geo` files (11,763 / 11,763 draw calls). Only 24 meshes have no
-  usable draw-call list and still fall back to path/name matching.
+  353 shipped `.geo` files: all 20,038 meshes and 22,484 draw calls resolve.
+  (A path/name fallback still exists for a record without a usable draw-call
+  list; no shipped mesh needs it.)
 * **The boost/glow state is not reproduced.** `characterglow`, `boostedversion`
   and the green "boosted" portraits are runtime shader/lighting effects. The
   importer reproduces the stored `blobshadingtexture` ramp as unlit emission,
@@ -344,8 +391,21 @@ Tested against the shipped PC data:
   ramp (`character_shading`, black → white); Blender lights the models instead.
 * **Mesh/node association is name based.** Ambiguous names fall back to
   positional matching and are reported as warnings.
-* **Instancing** is detected from shared geometry and kept on export, but the
-  association is heuristic for duplicated node names.
+* **Most placements are instanced, a few are unresolved.** 10,388 `.geo`
+  records place a model that is stored once elsewhere in the same file; those
+  resolve exactly by `CRC32(model_path)`. 91 records (0.9 %) hash a model that
+  is in neither the same `.geo` nor any sibling one (`JoeLWing`,
+  `Object05`, the `b_ceilinglamp01_ON*` lamps of `map_01_t`, some
+  `b_park_BG*` backdrop planes), so their nodes are imported empty and the
+  import reports one aggregated warning. The records themselves are preserved,
+  so a no-op export is unaffected.
+* **A mesh's second vertex/face buffer is a shadow copy.** Each static mesh
+  repeats its faces against a position-only vertex buffer (stride 12, welded
+  positions) with the same draw calls; it is not extra geometry, so the importer
+  reads only the first buffer. 385 meshes declare one to ten more faces in the
+  record header than the first face buffer can index; those triangles point at
+  vertices outside the vertex buffer, so they are dropped (the geometry and the
+  draw calls still agree with each other).
 * Unknown record tails and opaque nodes are preserved verbatim; they are never
   decoded into editable properties.
 * Animation import only; there is no animation export or `.ani` writer.

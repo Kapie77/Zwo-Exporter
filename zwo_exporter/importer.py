@@ -149,27 +149,6 @@ def _mesh_nodes(zwo):
     return [node for node in zwo.walk() if node.tag in MESH_NODE_TAGS]
 
 
-def _under_skeleton(zwo):
-    """Return the source indices of every node that hangs below a ``ZBON``.
-
-    A rigid part of a rig (the flyer's wing membranes) stores a mesh bind in the
-    first 48 bytes of its ``ZENT`` tail.  Props and FX carry an 81 byte tail too,
-    but there the numbers re-place decals or stretch particle strips instead of
-    binding a mesh, so only parts that belong to a rig get the correction.
-    """
-    below = set()
-
-    def walk(nodes, inside):
-        for node in nodes:
-            rigged = inside or node.tag == "ZBON"
-            if rigged:
-                below.add(node.source_index)
-            walk(node.children, rigged)
-
-    walk(zwo.children, False)
-    return below
-
-
 def _associate(meshes, nodes):
     """Map meshes to scene nodes.
 
@@ -328,10 +307,24 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
         vcol_socket = vcol.outputs["Color"]
 
     # "_onlycolordiffuse" is a neutral 4x4 placeholder: the real colour comes
-    # from the blob-shading ramp below (tentacles, nests, phials, ...).
+    # from `diffusecolor` and the vertex colours (tentacles, nests, phials, ...).
     diffuse_name = mat.texture_path
     placeholder = bool(diffuse_name) and \
         os.path.basename(diffuse_name).lower() == "_onlycolordiffuse"
+
+    # `diffusecolor` is the material tint the shader multiplies into the base
+    # colour -- ``diffuse * texture * vertex colour``.  Level art uses it to
+    # recolour one shared atlas: the road, the concrete and the decals each come
+    # in several tints, the basket's `_onlycolordiffuse` body is green, and the
+    # map's boundary plane (`black`) is pure black.  The key is absent when a
+    # material is not tinted; the parsed default of 0.8 grey is *not* a tint.
+    tint_value = props.get("diffusecolor")
+    tint = None
+    if isinstance(tint_value, (list, tuple)) and len(tint_value) >= 3 and all(
+            isinstance(c, (int, float)) for c in tint_value[:3]):
+        tint = (float(tint_value[0]), float(tint_value[1]), float(tint_value[2]), 1.0)
+        if all(abs(c - 1.0) <= 0.02 for c in tint[:3]):
+            tint = None
 
     # The shipped monster shader (shadow0/monster.fx) does not tint the texture
     # with the vertex colour: it uses the red channel as a blend mask between
@@ -471,6 +464,21 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
 
     if base_socket is None and vcol_socket is not None:
         base_socket = vcol_socket
+
+    # The tint is applied last so it also reaches the materials that carry no
+    # diffuse texture at all (`black`, `_onlycolordiffuse` bodies, decals).
+    if tint is not None:
+        tinted = nodes.new("ShaderNodeMix")
+        tinted.data_type = "RGBA"
+        tinted.blend_type = "MULTIPLY"
+        tinted.location = (-120, 320)
+        tinted.inputs["Factor"].default_value = 1.0
+        if base_socket is not None:
+            links.new(base_socket, tinted.inputs[6])
+        else:
+            tinted.inputs[6].default_value = (1.0, 1.0, 1.0, 1.0)
+        tinted.inputs[7].default_value = tint
+        base_socket = tinted.outputs[2]
 
     if base_socket is not None:
         links.new(base_socket, bsdf.inputs["Base Color"])
@@ -655,7 +663,7 @@ def _build_mesh_object(mesh, node, matrix, collection, asset_root, options, repo
                 if slot is None:
                     continue
                 start = call.first_face
-                end = start + call.face_count
+                end = min(start + call.face_count, len(data.polygons))
                 for index in range(start, end):
                     data.polygons[index].material_index = slot
         else:
@@ -1691,7 +1699,7 @@ def import_asset(context, zwo_path, options=None):
         arm_obj.matrix_world = frame
         arm_obj["zwo_frame_rotation"] = _flatten_matrix(frame)
     matrices = {node.source_index: matrix for node, matrix in nodes}
-    rigged = _under_skeleton(zwo)
+    mesh_objects = []
 
     if geo is not None and geo.meshes:
         mesh_nodes = [node for node, _m in nodes if node.tag in MESH_NODE_TAGS]
@@ -1701,14 +1709,21 @@ def import_asset(context, zwo_path, options=None):
                 "%d meshes instanced across %d nodes"
                 % (len(geo.meshes), len(pairs)))
         built = []
+        unresolved = 0
         for mesh, node in pairs:
+            if mesh.is_instance and mesh.source is None:
+                # The record points at a mesh that is not in this .geo; there
+                # is nothing to place, but the node keeps its bytes on export.
+                unresolved += 1
+                continue
             matrix = matrices.get(node.source_index) if node else Matrix.Identity(4)
             skinned = arm_obj is not None and bool(mesh.bone_weights)
             bind = None
-            if not skinned and node is not None and node.source_index in rigged:
-                # Rigid parts of a rig store their mesh-to-node matrix in the
-                # node tail: without it both flyer membranes land on the same
-                # side and one floats away from its bone.
+            if not skinned and node is not None:
+                # Rigid meshes are authored in their own pivot space; the node
+                # tail holds the mesh-to-node matrix the engine applies.  Without
+                # it the cars of a map sink into the ground, the flyer membranes
+                # land on the same side and a prop's parts drift apart.
                 bind = rigid_bind_matrix(node, zwo.endian)
                 if bind is not None:
                     matrix = matrix @ Matrix(bind)
@@ -1724,11 +1739,18 @@ def import_asset(context, zwo_path, options=None):
             obj["geo_file"] = geo_path
             if bind is not None:
                 obj["zwo_rigid_bind"] = _flatten_matrix(Matrix(bind))
+            # The placement Blender actually stored, read back so it carries the
+            # same float precision the exporter will compare against.  A node
+            # whose object still sits here is left untouched on export, which is
+            # what keeps a no-op round trip byte identical (re-deriving the local
+            # transform would lose the shear of a non-uniformly scaled parent).
+            # Refreshed at the end of the import, once the depsgraph has settled.
+            obj["zwo_rest_world"] = _flatten_matrix(obj.matrix_world)
+            mesh_objects.append(obj)
             if frame is not None:
                 # Remember the unanimated placement so rigid parts (wings) can be
                 # carried into the mesh frame while the animation plays, and keep
                 # the frame so the exporter can undo it when writing the node.
-                obj["zwo_rest_world"] = _flatten_matrix(obj.matrix_world)
                 if not skinned:
                     obj["zwo_frame"] = _flatten_matrix(frame)
             report["meshes"] += 1
@@ -1739,6 +1761,10 @@ def import_asset(context, zwo_path, options=None):
                 report["skinned"] += 1
             built.append((obj, mesh, node))
         report["bounds"] = len(mesh_nodes)
+        if unresolved:
+            report["warnings"].append(
+                "%d instance record(s) point at geometry that is not in this "
+                ".geo; their nodes were left empty" % unresolved)
         _tag_alternate_meshes(built, collection, report)
 
     if arm_obj is not None:
@@ -1749,6 +1775,18 @@ def import_asset(context, zwo_path, options=None):
         _build_lights(zwo, nodes, collection, report, zwo_path)
     if options.get("cameras", False):
         _build_cameras(zwo, nodes, collection, report, zwo_path)
+
+    if mesh_objects:
+        # Blender holds an object transform as location/rotation/scale, so a node
+        # placement carrying shear (a rigid bind under a non-uniformly scaled
+        # parent) is not representable: ``matrix_world`` keeps returning the
+        # assigned matrix until the depsgraph runs, and the first evaluation
+        # rebuilds it from ``matrix_basis`` with the shear gone.  Store the
+        # placement Blender really holds, so an untouched node still compares
+        # equal on export and keeps its original bytes (shear included).
+        context.view_layer.update()
+        for obj in mesh_objects:
+            obj["zwo_rest_world"] = _flatten_matrix(obj.matrix_world)
 
     return report
 

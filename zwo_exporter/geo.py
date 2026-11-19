@@ -19,6 +19,18 @@ Each mesh root:
     block[]  vertex / face / draw-call blocks
     byte[]   tail               (bounds, name record, materials or bone names)
 
+The level builder stores a model's geometry once and writes a **second record**
+for every further placement of it.  Such an *instance* root has ``0`` in the
+``first_block_id`` slot, the ``CRC32`` of the source's ``model_path`` in the
+``crc`` slot, and a running record id where the size would be.  Its blocks hold
+only the per-placement lightmap UVs (a 4-byte-stride ``VBFL``) and the draw
+calls; the vertices, faces and materials come from the source mesh named by the
+hash.  Every placement still has its own ``ZENT`` node, so a map that imports
+only the full roots loses half of its props (barrels, cans, bins, lamp posts,
+cars, foliage...).  :meth:`GeoFile.resolve_instances` links each instance to its
+source and :class:`GeoMesh` shares that geometry while keeping the record bytes
+for writing back untouched.
+
 A block is:
 
     u32      id
@@ -195,6 +207,9 @@ class GeoMesh:
         self.bone_names = []
         self.bounds = None
         self.needs_rebuild = False
+        # Instance records (a placement of a mesh that is stored elsewhere).
+        self.source_hash = None     # CRC32 of the source mesh's model_path
+        self.source = None          # resolved GeoMesh, set by GeoFile
 
     # -- decoded helpers ---------------------------------------------
     @property
@@ -204,6 +219,25 @@ class GeoMesh:
     @property
     def vertex_count(self):
         return len(self.positions)
+
+    @property
+    def is_instance(self):
+        return self.source_hash is not None
+
+    def share_geometry(self, source):
+        """Take ``source``'s geometry; the record itself stays untouched."""
+        self.positions = source.positions
+        self.normals = source.normals
+        self.uvs = source.uvs
+        self.colors = source.colors
+        self.faces = source.faces
+        self.bone_indices = source.bone_indices
+        self.bone_weights = source.bone_weights
+        self.vertex_raw = source.vertex_raw
+        self.stride = source.stride
+        self.format_id = source.format_id
+        self.format_id2 = source.format_id2
+        self.needs_rebuild = False
 
     def __repr__(self):
         return "<GeoMesh %s v=%d f=%d stride=%d mat=%r>" % (
@@ -273,8 +307,38 @@ class GeoFile:
             obj.items.append(("raw", data[cursor:]))
 
         obj.materials = _parse_material_palette(data, endian, roots)
+        obj.resolve_instances()
         _assign_materials(obj)
         return obj
+
+    def resolve_instances(self):
+        """Link every instance record to the mesh whose geometry it reuses.
+
+        The record's ``crc`` slot is ``CRC32(model_path)`` of the full mesh it
+        places.  Unresolvable hashes are left alone so the record is still
+        written back verbatim.
+        """
+        by_hash = {}
+        for mesh in self.meshes:
+            if mesh.is_instance or not mesh.model_path:
+                continue
+            key = zlib.crc32(mesh.model_path.encode("latin-1")) & 0xFFFFFFFF
+            by_hash.setdefault(key, mesh)
+        resolved = 0
+        for mesh in self.meshes:
+            if not mesh.is_instance:
+                continue
+            source = by_hash.get(mesh.source_hash)
+            if source is None or source is mesh:
+                continue
+            mesh.source = source
+            mesh.share_geometry(source)
+            # The record's own ``ZSEQ`` blocks name the materials of this
+            # placement (a fog sheet can reuse another one's geometry under a
+            # different material); decode them now that the face count is known.
+            mesh.draw_calls = _parse_draw_calls(mesh, self.endian)
+            resolved += 1
+        return resolved
 
     # -- writing -----------------------------------------------------
     def save(self, path):
@@ -316,13 +380,22 @@ def _find_roots(data, endian):
 
 
 def _valid_root(data, endian, off, size):
-    p = off + 8 + 4          # skip payload header ints
-    if p + 20 > len(data):
-        return False
-    length = struct.unpack_from(endian + "I", data, p + 8)[0]
-    tag, tag2 = data[p + 12:p + 16], data[p + 16:p + 20]
-    return tag == tag2 and _tag_name(tag, endian) in BLOCK_TAGS \
-        and 0 <= length <= len(data) - (p + 20)
+    """True when ``off`` starts a mesh root with a reachable block chain.
+
+    A mesh root stores the first block header right after the face count
+    (payload + 4).  Instance records put the source hash and the record id
+    before it, so their chain starts at payload + 12.
+    """
+    for shift in (4, 12):
+        p = off + 8 + shift
+        if p + 20 > len(data):
+            continue
+        length = struct.unpack_from(endian + "I", data, p + 8)[0]
+        tag, tag2 = data[p + 12:p + 16], data[p + 16:p + 20]
+        if tag == tag2 and _tag_name(tag, endian) in BLOCK_TAGS \
+                and 0 <= length <= len(data) - (p + 20):
+            return True
+    return False
 
 
 MAX_BLOCK_GAP = 64
@@ -396,6 +469,11 @@ def _parse_mesh(data, endian, off, size):
     mesh.payload_size = size
     mesh.tail = data[chain_end:payload + size]
 
+    # An instance record has no first block id; the slot holds the CRC32 of the
+    # model path of the mesh it places and the block chain starts 8 bytes later.
+    if mesh.head_ints[1] == 0:
+        mesh.source_hash = mesh.head_ints[2]
+
     main_vb = None
     face_payload = None
     for block in blocks:
@@ -425,7 +503,15 @@ def _parse_mesh(data, endian, off, size):
 
 
 def _parse_draw_calls(mesh, endian):
-    """Decode the first valid ``ZSEQ`` block into per-material face ranges."""
+    """Decode the first valid ``ZSEQ`` block into per-material face ranges.
+
+    The calls are checked against the decoded face buffer, so this only works
+    once the mesh has its geometry.  Instance records inherit theirs from the
+    mesh they place; :meth:`GeoFile.resolve_instances` runs it for them.
+    """
+    face_total = len(mesh.faces)
+    if not face_total:
+        return []
     for block in mesh.blocks:
         if block.tag != "ZSEQ" or len(block.payload) < 8:
             continue
@@ -436,11 +522,11 @@ def _parse_draw_calls(mesh, endian):
         for k in range(count):
             index_offset, _zero, face_count, material_hash, flags = \
                 struct.unpack_from(endian + "5I", block.payload, 8 + k * 20)
-            if index_offset % 3 or index_offset // 3 + face_count > len(mesh.faces):
+            if index_offset % 3 or index_offset // 3 + face_count > face_total:
                 calls = None
                 break
             calls.append(GeoDrawCall(index_offset, face_count, material_hash, flags))
-        if calls and sum(call.face_count for call in calls) == len(mesh.faces):
+        if calls and sum(call.face_count for call in calls) == face_total:
             return calls
     return []
 

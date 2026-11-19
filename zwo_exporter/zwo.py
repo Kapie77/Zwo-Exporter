@@ -57,15 +57,14 @@ BIND_TAIL_LEN = 109
 #: Offset of the 3x4 inverse bind matrix inside that tail.  The first 61 bytes
 #: are a constant identity block and 13 zero bytes in every shipped file.
 BIND_MATRIX_OFFSET = BIND_TAIL_LEN - 48
-#: Length of the tail stored on a plain ``ZENT`` node.  The first 48 bytes are a
-#: 3x4 mesh-to-node matrix used by rigid parts of a rig (the flyer's wing
-#: membranes); the rest is a constant ``0 0 0 1 0 0 0 0`` block plus a
-#: ``ffffffff`` terminator.
-RIGID_TAIL_LEN = 81
-#: Largest deviation from an orthonormal 3x3 accepted for that matrix.  Props and
-#: FX also carry a 3x4 tail but it is *not* a mesh bind (it re-places decals,
-#: stretches particle strips), so anything that is not a clean rigid transform is
-#: rejected instead of guessed at.
+#: Size of the 3x4 matrix at the start of a mesh node's tail.  Any tail long
+#: enough carries it: it maps the mesh vertices from their own pivot space into
+#: node space (cars on the maps lift off the ground by it, the flyer's wing
+#: membranes sit on their bones, props such as the basket only line up with it).
+RIGID_BIND_LEN = 48
+#: Largest deviation from an orthonormal 3x3 accepted for that matrix.  A few
+#: FX tails hold a stretched frame instead of a mesh bind, so anything that is
+#: not a clean rigid transform is rejected instead of guessed at.
 RIGID_BIND_TOLERANCE = 1e-3
 
 
@@ -149,22 +148,22 @@ def node_bind_matrix(node, endian="<"):
 
 
 def rigid_bind_matrix(node, endian="<", tolerance=RIGID_BIND_TOLERANCE):
-    """Return the mesh-to-node matrix of a rigid ``ZENT`` part, or ``None``.
+    """Return the mesh-to-node matrix at the start of a node tail, or ``None``.
 
-    Rigid pieces of a rig (the flyer's wing membranes) hang from a plain
-    ``ZENT`` node whose 81 byte tail starts with a 3x4 row-major matrix.  The
-    mesh vertices are stored in the *part's* space, so ``world @ matrix`` puts
-    them where the engine draws them; without it both membranes of the flyer
-    land on the same side and one floats away from its bone.
+    Every rigid mesh node stores a 3x4 row-major matrix in the first 48 bytes of
+    its tail.  The mesh vertices live in the *part's* own pivot space, so
+    ``node_world @ matrix`` puts them where the engine draws them: it lifts the
+    cars of a map out of the ground, seats the flyer's wing membranes on their
+    bones and lines the parts of a prop up with each other.  Skinned meshes are
+    the exception -- their tail lists bones and the armature does the mapping --
+    so the importer only asks for the matrix on rigid meshes.
 
-    The same 81 byte tail shows up on props and FX, where the numbers are not a
-    mesh bind at all (they move decals around, turn a vertical particle strip
-    horizontal).  Only a clean rigid transform -- orthonormal 3x3, positive
-    determinant, finite -- is accepted here; the importer also restricts the
-    correction to rigid meshes that hang below a ``ZBON`` node.
+    A handful of FX tails carry a stretched frame instead of a mesh bind, so
+    only a clean rigid transform -- orthonormal 3x3, positive determinant,
+    finite -- is accepted here.
     """
     tail = node.tail or b""
-    if len(tail) != RIGID_TAIL_LEN:
+    if len(tail) < RIGID_BIND_LEN:
         return None
     values = struct.unpack_from(endian + "12f", tail, 0)
     if not all(math.isfinite(value) for value in values):

@@ -56,22 +56,33 @@ def _read_geometry(obj):
     return positions, uvs, _polygons_of(mesh)
 
 
+def _solid_faces(faces):
+    """Set of real triangles, dropping degenerate ones (a repeated index).
+
+    A triangle such as ``(8, 9, 9)`` draws nothing, so ``mesh.validate()``
+    removes it when the importer builds the Blender mesh.
+    """
+    return {tuple(sorted(face)) for face in faces
+            if len(face) == 3 and len(set(face)) == 3}
+
+
 def _faces_equal(old_faces, new_faces):
     """Compare face lists, ignoring winding rotation and duplicate faces.
 
-    Blender's ``mesh.validate()`` drops duplicated triangles and may rotate the
-    indices inside a triangle, neither of which is a real edit.
+    Blender's ``mesh.validate()`` drops duplicated and degenerate triangles and
+    may rotate the indices inside a triangle, neither of which is a real edit.
     """
     if old_faces == new_faces:
         return True
-    if len(new_faces) > len(old_faces):
-        return False
-    return ({tuple(sorted(face)) for face in new_faces} ==
-            {tuple(sorted(face)) for face in old_faces})
+    return _solid_faces(old_faces) == _solid_faces(new_faces)
 
 
-def _apply_geometry(obj, geo_mesh, report):
-    """Copy the Blender mesh into ``geo_mesh``; flag a rebuild only if it changed."""
+def _apply_geometry(obj, geo_mesh, report, dry_run=False):
+    """Copy the Blender mesh into ``geo_mesh``; flag a rebuild only if it changed.
+
+    With ``dry_run`` the comparison is made but nothing is written; the caller
+    uses it to report edits on a record that cannot hold geometry (an instance).
+    """
     positions, uvs, faces = _read_geometry(obj)
 
     changed = len(positions) != len(geo_mesh.positions)
@@ -89,8 +100,8 @@ def _apply_geometry(obj, geo_mesh, report):
                 changed = True
                 break
 
-    if not changed:
-        return False
+    if not changed or dry_run:
+        return changed
 
     if len(positions) != len(geo_mesh.positions):
         report["warnings"].append(
@@ -120,22 +131,6 @@ def _set_local(node, parent_world, world, force=False):
     node.rotation = (rot.x, rot.y, rot.z, rot.w)
     node.scale = (scale.x, scale.y, scale.z)
     return True
-
-
-def _world_matrices(zwo):
-    from mathutils import Matrix
-
-    out = {}
-
-    def walk(node, parent_world):
-        matrix = parent_world @ Matrix(node.matrix())
-        out[node.source_index] = matrix
-        for child in node.children:
-            walk(child, matrix)
-
-    for child in zwo.children:
-        walk(child, Matrix.Identity(4))
-    return out
 
 
 def _matrix_close(a, b, epsilon=1e-5):
@@ -169,16 +164,31 @@ def _node_space_world(obj):
     return frame.inverted() @ world
 
 
+def _stored_matrix(obj, key):
+    """Return a 4x4 matrix stored by the importer as a flat list, or ``None``."""
+    from mathutils import Matrix
+
+    values = obj.get(key)
+    if not values:
+        return None
+    values = list(values)
+    if len(values) != 16:
+        return None
+    return Matrix(tuple(tuple(values[row * 4:(row + 1) * 4]) for row in range(4)))
+
+
 def _update_node_transforms(zwo, objects, report):
     """Write every edited object's world transform back into its node.
 
     Nodes are visited parent-first so a moved parent also updates the local
     matrices of its edited children.  Objects whose world matrix did not change
-    keep their parsed floats, which keeps a no-op export byte identical.
+    keep their parsed floats, which keeps a no-op export byte identical: the
+    comparison uses the placement the importer stored after Blender evaluated
+    it, not the raw node matrix, because a node under a non-uniformly scaled
+    parent carries a shear that Blender cannot hold in ``matrix_basis``.
     """
     from mathutils import Matrix
 
-    original = _world_matrices(zwo)
     by_node = {}
     for obj in objects:
         index = obj.get("zwo_node")
@@ -192,9 +202,10 @@ def _update_node_transforms(zwo, objects, report):
         changed = False
         if obj is not None:
             seen.add(node.source_index)
-            world = _node_space_world(obj)
-            if parent_changed or not _matrix_close(
-                    world, original[node.source_index]):
+            rest = _stored_matrix(obj, "zwo_rest_world")
+            moved = rest is None or not _matrix_close(obj.matrix_world, rest, 1e-6)
+            if parent_changed or moved:
+                world = _node_space_world(obj)
                 _set_local(node, parent_world, world, force=True)
                 touched.add(node.source_index)
                 changed = True
@@ -260,7 +271,19 @@ def export_asset(objects, zwo_path, geo_path=None, options=None):
                 "%r shares geometry with another instance; kept the first "
                 "edited copy" % obj.name)
             continue
-        if _apply_geometry(obj, meshes[mesh_index], report):
+        geo_mesh = meshes[mesh_index]
+        if geo_mesh.is_instance:
+            # The record holds only the placement's lightmap UVs and draw
+            # calls; the vertices belong to the mesh it points at.  Writing an
+            # edit here would silently drop it, so say so instead.
+            if _apply_geometry(obj, geo_mesh, report, dry_run=True):
+                report["warnings"].append(
+                    "%r is an instance of %r; its geometry is shared and the "
+                    "edit was not written (edit the source mesh instead)"
+                    % (obj.name, geo_mesh.source.model_path.rsplit("/", 1)[-1]
+                       if geo_mesh.source is not None else "a missing mesh"))
+            continue
+        if _apply_geometry(obj, geo_mesh, report):
             report["meshes"] += 1
             applied.add(mesh_index)
 
