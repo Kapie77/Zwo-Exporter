@@ -1,12 +1,13 @@
 # Zwo Exporter (Final Exam)
 
-A Blender 4.2 add-on for **Final Exam** (PC / Steam) scene assets. It imports
-and exports the game's `.zwo` scene graphs together with their sibling `.geo`
-geometry, `.hvt` textures and `.ani` animations.
+A Blender 4.2 add-on for **Final Exam** (PC / Steam and PS3) scene assets. It
+imports and exports the game's `.zwo` scene graphs together with their sibling
+`.geo` geometry, `.hvt` textures and `.ani` animations.
 
-The PC build is the primary target. The PS3 assets use the same record layout
-with the opposite byte order and are handled by the same parsers, but PS3
-animations have not been verified because no PS3 `.ani` files were available.
+The PC build is the primary target. The PS3 build uses the same record layout,
+the opposite byte order and a packed vertex format; both are handled by the same
+parsers and both have been validated against the full shipped data (see
+[PS3 build](#ps3-build)).
 
 ---
 
@@ -14,7 +15,7 @@ animations have not been verified because no PS3 `.ani` files were available.
 
 | Game                     |   PC   | Xbox 360 | PS3    |
 |--------------------------|:------:|:------:|:-------:|
-| Final Exam               |   ✅   |      |      |
+| Final Exam               |   ✅   |      |   ✅   |
 
 ## Quick Guide
 
@@ -212,13 +213,51 @@ animations have not been verified because no PS3 `.ani` files were available.
   chunks and `map_00_a` export byte-identically.
 * **Degenerate triangles do not trigger a rebuild.** A few map records contain a
   zero-area triangle (a repeated vertex index, e.g. `(8, 9, 9)` in the
-  `shop06`/`shop07`/`shop08` of `map_01_n`). `mesh.validate()` drops it on
-  import, and the exporter ignores degenerate faces when deciding whether the
-  geometry changed, so the record keeps its bytes. If the mesh is edited for
-  real, the rebuilt record carries the reduced face count and the import warning
-  (`face count changed during import (13 -> 12)`) explains the difference.
+  `shop06`/`shop07`/`shop08` of `map_01_n`, or `(380, 380, 381)` in the PS3
+  `boss_fallingrocks`), and some records store the same triangle twice.
+  `mesh.validate()` drops both on import, and the exporter ignores degenerate and
+  duplicated faces when deciding whether the geometry changed, so the record
+  keeps its bytes. Vertices that were used only by a dropped triangle keep their
+  stored UV, because Blender leaves them without a loop. If the mesh is edited
+  for real, the rebuilt record carries the reduced face count and the import
+  warning (`face count changed during import (13 -> 12)`) explains the
+  difference.
 * A `.bak` copy of the original `.zwo`/`.geo` pair is created before the first
   overwrite.
+
+## PS3 build
+
+The PS3 extraction is a drop-in replacement for the PC one: same paths, same
+record layout, same node trees, materials and geometry. Import a PS3 `.zwo` from
+its extracted folder exactly like a PC one; nothing has to be converted.
+
+* **Byte order.** Integers are big-endian and record tags read literally
+  (`ZROO`, `NAON`), where the PC build stores little-endian numbers and
+  byte-reversed tags (`OORZ`, `NOAN`). `.zwo`, `.geo`, `.ani` and `.hvt` are all
+  detected automatically.
+* **Vertex format.** PS3 vertices are packed: stride 32 (static) / 48 (skinned)
+  instead of the PC 56 / 72. Positions, packed 11-11-10 tangent frame, colour,
+  UVs and the four skin weights/bone indices decode to the same values as the
+  PC build. The UV pair is one word with `u` in the high half on PS3 (the PC
+  stores `u` in the low half); both orders are handled.
+* **Animations.** PS3 `.ani` files are big-endian and import into identical
+  F-curves as their PC counterparts (same bones, tracks, durations and values).
+* **Textures.** PS3 ships 1,337 `.hvt` files against the PC's 1,983 (platform
+  UI art differs, e.g. `buttons_ps3` vs `buttons_360`). Shared textures decode
+  to the same payloads; a few dozen UI textures are stored as DXT5/DXT1 on PS3
+  where the PC keeps uncompressed ARGB, which the existing decoder handles.
+
+Verified against the full PS3 extraction:
+
+* 353/353 `.zwo`, 353/353 `.geo` and 1,953/1,953 `.ani` parse and re-serialize
+  byte-identically.
+* 353 `.zwo` node trees, 5,092 materials, 20,129 meshes, 4,707,334 vertices and
+  2,952,153 faces are equivalent to the PC build (same names, transforms,
+  material properties, positions, UVs and triangles).
+* All 353 assets import and export unchanged byte-for-byte, with world matrices
+  and bounding boxes matching the PC build exactly.
+* Animation import produces identical actions for the sampled clips
+  (`bottom_walk`, `chainsaw_run`, `9mm_aim_front_shoot`).
 
 ## Materials
 
@@ -365,10 +404,21 @@ Tested against the shipped PC data:
 * 9,741 meshes, 3,160,928 vertices and 1,979,818 faces parse and rebuild.
 * Untouched imports export byte-identically (no changes are invented).
 
+Tested against the shipped PS3 data:
+
+* 353/353 `.zwo`, 353/353 `.geo` and 1,953/1,953 `.ani` files re-serialize
+  byte-identically.
+* All 353 assets import and export unchanged byte-for-byte, including the
+  20,038 meshes with degenerate or duplicated triangles that `mesh.validate()`
+  drops.
+* 1,953 animations parse (49,134 records, 49,050 tracks); the 292 `.ani` files
+  under `skins\` carry no tracks in either build.
+
 ## Limitations
 
-* **PC first.** PS3 assets parse in the format layer but are not part of the
-  validated Blender workflow. PS3 `.ani` files were not available to verify.
+* **PC first.** The PC build is the primary target and the one with the
+  longest test history; the PS3 build is validated against the full extraction
+  (see [PS3 build](#ps3-build)) but has seen less in-game comparison.
 * **Checksums are not recomputed.** `.geo` block checksums are not CRC32 and
   their algorithm is unknown, so they are preserved byte-for-byte. This is fine
   for untouched blocks; rebuilt geometry keeps the original checksum value.
@@ -439,6 +489,8 @@ with plain Python.
 * PS3: big-endian integers with literal tags.
 * `.ani` track tags are matched in both spellings because the shipped files mix
   conventions.
+* The packed UV word also swaps halves: PS3 stores `u` in the high half, PC in
+  the low half.
 
 ## Troubleshooting
 

@@ -588,7 +588,12 @@ def _decode_vertices(mesh, endian, payload, stride, count):
         nrm.append(_frame_normal(chunk, lay))
         if stride >= 28:
             uword = struct.unpack_from(endian + "I", chunk, lay["uv"])[0]
-            uvs.append((_half(uword & 0xFFFF), _half(uword >> 16)))
+            # The pair is stored ``u`` first, ``v`` second; reading the two
+            # halves as one big-endian word puts ``u`` in the high half.
+            if lay["pc"]:
+                uvs.append((_half(uword & 0xFFFF), _half(uword >> 16)))
+            else:
+                uvs.append((_half(uword >> 16), _half(uword & 0xFFFF)))
             c = struct.unpack_from(endian + "I", chunk, lay["color"])[0]
             if c == 0xFFFFFFFF:
                 col.append((1.0, 1.0, 1.0, 1.0))

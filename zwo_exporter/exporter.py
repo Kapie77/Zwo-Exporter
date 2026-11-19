@@ -85,6 +85,15 @@ def _apply_geometry(obj, geo_mesh, report, dry_run=False):
     """
     positions, uvs, faces = _read_geometry(obj)
 
+    if uvs and len(uvs) == len(geo_mesh.uvs):
+        # ``mesh.validate()`` drops degenerate and duplicate triangles, so a
+        # vertex used only by one of them has no loop left and therefore no UV.
+        # Its stored UV is still valid data, so keep it instead of writing 0,0.
+        used = {index for face in faces for index in face}
+        for index in range(len(uvs)):
+            if index not in used:
+                uvs[index] = tuple(geo_mesh.uvs[index])
+
     changed = len(positions) != len(geo_mesh.positions)
     if not changed:
         for old, new in zip(geo_mesh.positions, positions):

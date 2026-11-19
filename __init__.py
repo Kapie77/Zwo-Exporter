@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Zwo Exporter (Final Exam)",
     "author": "Kaplan",
-    "version": (1, 0, 14),
+    "version": (1, 0, 15),
     "blender": (4, 2, 0),
     "location": "File > Import-Export > Final Exam ZWO",
     "description": "Import and export Final Exam (.zwo / .geo / .hvt / .ani) assets",
