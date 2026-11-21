@@ -1,13 +1,13 @@
 # Zwo Exporter (Final Exam)
 
-A Blender 4.2 add-on for **Final Exam** (PC / Steam and PS3) scene assets. It
-imports and exports the game's `.zwo` scene graphs together with their sibling
-`.geo` geometry, `.hvt` textures and `.ani` animations.
+A Blender 4.2 add-on for **Final Exam** (PC / Steam, PS3 and Xbox 360) scene
+assets. It imports and exports the game's `.zwo` scene graphs together with
+their sibling `.geo` geometry, `.hvt` textures and `.ani` animations.
 
-The PC build is the primary target. The PS3 build uses the same record layout,
-the opposite byte order and a packed vertex format; both are handled by the same
-parsers and both have been validated against the full shipped data (see
-[PS3 build](#ps3-build)).
+The PC build is the primary target. The PS3 and Xbox 360 builds use the same
+record layout, the opposite byte order and a packed vertex format; all three are
+handled by the same parsers and have been validated against the full shipped
+data (see [PS3 build](#ps3-build) and [Xbox 360 build](#xbox-360-build)).
 
 ---
 
@@ -15,7 +15,7 @@ parsers and both have been validated against the full shipped data (see
 
 | Game                     |   PC   | Xbox 360 | PS3    |
 |--------------------------|:------:|:------:|:-------:|
-| Final Exam               |   ✅   |      |   ✅   |
+| Final Exam               |   ✅   |   ✅   |   ✅   |
 
 ## Quick Guide
 
@@ -259,6 +259,39 @@ Verified against the full PS3 extraction:
 * Animation import produces identical actions for the sampled clips
   (`bottom_walk`, `chainsaw_run`, `9mm_aim_front_shoot`).
 
+## Xbox 360 build
+
+The Xbox 360 extraction is also a drop-in replacement: same paths, same record
+layout, same node trees, materials and geometry as the PS3 build. Import an X360
+`.zwo` from its extracted folder like any other; nothing has to be converted.
+
+* **Byte order and vertex format.** Like PS3, integers are big-endian with
+  literal tags and vertices use the packed 32/48-byte layout, so the PS3 vertex
+  decoder serves the X360 data unchanged. `.zwo`, `.geo` and `.ani` parse and
+  re-serialize byte-identically.
+* **Textures.** X360 `.hvt` files keep every mip level (and every cube face) in
+  a single `DATA` chunk, stored in the Xenos tiled layout: 32×32-block macro
+  tiles (`Tiled2D`), the mip chain following the base level, and the smallest
+  levels packed into one tile. The DXT payload is also byte-swapped in 16-bit
+  words relative to the PS3/PC blocks, and uncompressed 32-bit pixels are stored
+  `A,R,G,B`. The decoder undoes all three and emits the same DDS as the PC
+  build (the three `*_360` UI atlases decode to the PC bytes exactly).
+* **Cube maps.** `env*` textures are six-face cube maps in a level-major
+  layout. The importer keeps face 0, matching how the PS3 container (which
+  repeats the mip indices once per face) is collapsed.
+
+Verified against the full X360 extraction:
+
+* 353/353 `.zwo`, 353/353 `.geo` and 1,953/1,953 `.ani` parse and re-serialize
+  byte-identically (49,134 records, 49,050 tracks).
+* 20,129 meshes, 4,707,334 vertices, 2,952,153 faces, 5,092 materials and all
+  node trees are identical to the PS3 build (same positions, UVs, triangles,
+  colours, weights and bone names).
+* All 353 assets import and export unchanged byte-for-byte.
+* 1,337 `.hvt` textures decode; every texture shared with the PS3/PC builds is
+  byte-identical (including the first face of the 14 cube maps), and the
+  X360-only `buttons_360`/`buttons_big_360` atlases decode to the PC DDS.
+
 ## Materials
 
 Materials are rebuilt from the `.geo` palette. The properties that drive the
@@ -417,8 +450,9 @@ Tested against the shipped PS3 data:
 ## Limitations
 
 * **PC first.** The PC build is the primary target and the one with the
-  longest test history; the PS3 build is validated against the full extraction
-  (see [PS3 build](#ps3-build)) but has seen less in-game comparison.
+  longest test history; the PS3 and Xbox 360 builds are validated against their
+  full extractions (see [PS3 build](#ps3-build) and
+  [Xbox 360 build](#xbox-360-build)) but have seen less in-game comparison.
 * **Checksums are not recomputed.** `.geo` block checksums are not CRC32 and
   their algorithm is unknown, so they are preserved byte-for-byte. This is fine
   for untouched blocks; rebuilt geometry keeps the original checksum value.
@@ -486,11 +520,13 @@ with plain Python.
 ## Byte order
 
 * PC: little-endian integers with byte-reversed record tags (e.g. `NAON`).
-* PS3: big-endian integers with literal tags.
+* PS3 and Xbox 360: big-endian integers with literal tags.
 * `.ani` track tags are matched in both spellings because the shipped files mix
   conventions.
-* The packed UV word also swaps halves: PS3 stores `u` in the high half, PC in
-  the low half.
+* The packed UV word also swaps halves: PS3/X360 store `u` in the high half, PC
+  in the low half.
+* `.hvt` DXT blocks are byte-swapped in 16-bit words on X360; uncompressed
+  32-bit pixels are `A,R,G,B` on X360 and `B,G,R,A` on PC.
 
 ## Troubleshooting
 
