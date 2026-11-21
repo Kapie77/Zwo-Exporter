@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Zwo Exporter (Final Exam)",
     "author": "Kaplan",
-    "version": (1, 0, 17),
+    "version": (1, 0, 18),
     "blender": (4, 0, 0),
     "location": "File > Import-Export > Final Exam ZWO",
     "description": "Import and export Final Exam (.zwo / .geo / .hvt / .ani) assets",
@@ -38,6 +38,13 @@ class ZWO_OT_import(bpy.types.Operator, ImportHelper):
         description="Load .hvt textures through a generated DDS wrapper")
     use_lights: BoolProperty(name="Lights", default=True)
     use_cameras: BoolProperty(name="Cameras", default=False)
+    fallback_root: StringProperty(
+        name="Fallback data folder",
+        subtype="DIR_PATH",
+        default="",
+        description=("Optional complete extraction of the same build, used for "
+                     ".geo/.hvt when this .zwo folder only holds scenes. "
+                     "Empty = use the add-on preference"))
 
     def execute(self, context):
         path = bpy.path.ensure_ext(self.filepath, ".zwo")
@@ -48,6 +55,7 @@ class ZWO_OT_import(bpy.types.Operator, ImportHelper):
             "textures": self.use_textures,
             "lights": self.use_lights,
             "cameras": self.use_cameras,
+            "fallback_root": _fallback_root(context, self.fallback_root),
         }
         try:
             report = import_asset(context, path, options)
@@ -239,6 +247,28 @@ def _active_armature(context):
     return None
 
 
+# ------------------------------------------------------------ preferences
+class ZWO_AddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__ or "Zwo Exporter"
+
+    fallback_root: StringProperty(
+        name="Fallback data folder",
+        subtype="DIR_PATH",
+        default="",
+        description=("Complete extraction of the same build (the folder that "
+                     "contains 'common' and 'maps'). Used for .geo/.hvt files "
+                     "when the imported .zwo comes from a scene-only rip"))
+
+
+def _fallback_root(context, override=""):
+    """Operator override first, then the add-on preference."""
+    if override:
+        return override
+    addon = context.preferences.addons.get(__package__ or "Zwo Exporter")
+    prefs = addon.preferences if addon is not None else None
+    return getattr(prefs, "fallback_root", "") if prefs is not None else ""
+
+
 # ---------------------------------------------------------------- menus
 def _menu_import(self, context):
     self.layout.operator("import_scene.fexam_zwo", text="Final Exam (.zwo)")
@@ -255,6 +285,7 @@ CLASSES = (
     ZWO_OT_export,
     ZWO_OT_export_all,
     ZWO_PT_panel,
+    ZWO_AddonPreferences,
 )
 
 

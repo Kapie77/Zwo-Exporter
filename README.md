@@ -55,6 +55,12 @@ supported version.
   (geometry) file must be **in the same folder and have the same name** as the `.zwo`
   file (`basic.zwo` → `basic.geo`). A `.zwo` file copied on its own to another folder cannot
   generate meshes.
+* **Scene-only rips.** Some archives unpack as scenes only (`data.hvp\...` holds
+  just the `.zwo` files). Point **Fallback data folder** — in the add-on
+  preferences or in the import dialog — at a complete extraction of the **same
+  build**: the importer then finds the missing `.geo` and `.hvt` at the same
+  relative path there. Exporting back into the scene-only folder rewrites only
+  the `.zwo` and warns that the geometry was not written.
 * For **textures**, the corresponding `.hvt` file must also be extracted.
 * For **animations**, the `.ani` files must also be extracted (they are
   usually located in `...\anims\` or `...\anims\all\`). First import the character's `.zwo` file,

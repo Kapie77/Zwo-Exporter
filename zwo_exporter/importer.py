@@ -103,12 +103,14 @@ def asset_root_for(path):
     return os.path.dirname(os.path.abspath(path))
 
 
-def _find_sibling(path, extension):
+def _find_sibling(path, extension, fallback_root=None):
     """Find ``<stem><extension>`` next to ``path`` (case-insensitive).
 
     Windows is normally case-insensitive, but asset rips and network shares can
     carry upper-case extensions such as ``BASIC.GEO``.  Returning ``None``
-    lets the caller distinguish a missing file from a parse error.
+    lets the caller distinguish a missing file from a parse error.  When the
+    file is not next to the scene (a scene-only rip), the same relative path is
+    looked up under ``fallback_root``.
     """
     base = os.path.splitext(path)[0]
     direct = base + extension
@@ -119,10 +121,42 @@ def _find_sibling(path, extension):
     try:
         names = os.listdir(folder)
     except OSError:
-        return None
+        names = []
     for name in names:
         name_stem, name_ext = os.path.splitext(name)
         if name_stem.lower() == stem and name_ext.lower() == extension.lower():
+            return os.path.join(folder, name)
+    return _fallback_sibling(path, extension, fallback_root)
+
+
+def _fallback_sibling(path, extension, fallback_root):
+    """Locate ``<stem><extension>`` under ``fallback_root`` by relative path."""
+    if not fallback_root:
+        return None
+    source_root = asset_root_for(path)
+    target_root = fallback_root
+    if not (os.path.isdir(os.path.join(target_root, "common")) or
+            os.path.isdir(os.path.join(target_root, "maps"))):
+        target_root = asset_root_for(fallback_root)
+    if not target_root:
+        return None
+    rel_dir = os.path.relpath(os.path.dirname(os.path.abspath(path)),
+                              source_root)
+    if rel_dir.startswith(".."):
+        rel_dir = ""
+    folder = os.path.join(target_root, rel_dir)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    candidate = os.path.join(folder, stem + extension)
+    if os.path.isfile(candidate):
+        return candidate
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    for name in names:
+        name_stem, name_ext = os.path.splitext(name)
+        if name_stem.lower() == stem.lower() and \
+                name_ext.lower() == extension.lower():
             return os.path.join(folder, name)
     return None
 
@@ -202,7 +236,8 @@ def _mask_colour(nodes, links, value_socket, location):
     return combine.outputs[0]
 
 
-def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=False):
+def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=False,
+                    fallback_root=None):
     key = _material_key(mat.path or mat.name or "material")
     if use_vertex_colour:
         key += "#vcol"
@@ -346,7 +381,7 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
     vcol_tint = vcol_socket is not None and not blob_name
 
     if use_textures and diffuse_name and not placeholder:
-        path = texture_path_for_asset(diffuse_name, asset_root)
+        path = texture_path_for_asset(diffuse_name, asset_root, fallback_root)
         if path:
             image = _load_texture(path, report)
             if image is not None:
@@ -394,7 +429,7 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
     #
     # which is the same sum, with the lit part left for Blender's lights.
     if use_textures and blob_shader and vcol_socket is not None:
-        blob_path = texture_path_for_asset(blob_name, asset_root)
+        blob_path = texture_path_for_asset(blob_name, asset_root, fallback_root)
         if blob_path:
             blob_image = _load_texture(blob_path, report)
             if blob_image is not None:
@@ -487,7 +522,7 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
 
     normal_name = props.get("normaltexture")
     if use_textures and normal_name and props.get("usenormaltexture", True):
-        path = texture_path_for_asset(normal_name, asset_root)
+        path = texture_path_for_asset(normal_name, asset_root, fallback_root)
         if path:
             image = _load_texture(path, report)
             if image is not None:
@@ -513,7 +548,7 @@ def _build_material(mat, asset_root, use_textures, report, use_vertex_colour=Fal
     spec_name = props.get("speculartexture")
     if use_textures and spec_name and props.get("usespeculartexture") and \
             specular_level > 0.0 and "Specular IOR Level" in bsdf.inputs:
-        path = texture_path_for_asset(spec_name, asset_root)
+        path = texture_path_for_asset(spec_name, asset_root, fallback_root)
         if path:
             image = _load_texture(path, report)
             if image is not None:
@@ -593,6 +628,7 @@ def _apply_vertex_colours(mesh, data):
 
 def _build_mesh_object(mesh, node, matrix, collection, asset_root, options, report):
     name = node.name if node else "mesh_%03d" % max(0, mesh.index)
+    fallback_root = options.get("fallback_root")
     data = bpy.data.meshes.new(name + "_mesh")
     # `.geo` vertices and the node transforms share one Z-up space, so they are
     # imported unchanged.
@@ -646,7 +682,8 @@ def _build_mesh_object(mesh, node, matrix, collection, asset_root, options, repo
         slots[id(material)] = len(data.materials)
         data.materials.append(_build_material(material, asset_root,
                                              use_textures, report,
-                                             use_vertex_colour))
+                                             use_vertex_colour,
+                                             fallback_root))
     if not data.materials:
         material = mesh.material
         if material is None and report["geo"] is not None and report["geo"].materials:
@@ -654,7 +691,8 @@ def _build_mesh_object(mesh, node, matrix, collection, asset_root, options, repo
         if material is not None:
             data.materials.append(_build_material(material, asset_root,
                                                  use_textures, report,
-                                                 use_vertex_colour))
+                                                 use_vertex_colour,
+                                                 fallback_root))
             slots[id(material)] = 0
     if calls:
         if len(data.polygons) == len(mesh.faces):
@@ -1677,7 +1715,14 @@ def import_asset(context, zwo_path, options=None):
     }
 
     base, _ext = os.path.splitext(zwo_path)
-    geo_path = _find_sibling(zwo_path, ".geo")
+    fallback_root = options.get("fallback_root")
+    if isinstance(fallback_root, str):
+        fallback_root = fallback_root.strip() or None
+    else:
+        fallback_root = None
+    if fallback_root and not os.path.isdir(fallback_root):
+        fallback_root = None
+    geo_path = _find_sibling(zwo_path, ".geo", fallback_root)
     asset_root = asset_root_for(zwo_path)
 
     zwo = ZwoFile.load(zwo_path)
@@ -1691,8 +1736,9 @@ def import_asset(context, zwo_path, options=None):
         try:
             if not any(name.lower().endswith(".geo") for name in os.listdir(folder)):
                 hint = (" This folder has no .geo files at all, so it looks like only "
-                        "the .zwo scenes were extracted; re-extract the full game data "
-                        "(.geo/.hvt/.ani) or import from the complete data folder.")
+                        "the .zwo scenes were extracted. Re-extract the full game data "
+                        "(.geo/.hvt/.ani) or set 'Fallback data folder' to a complete "
+                        "extraction of the same build.")
         except OSError:
             pass
         # Fail before creating anything so no orphan armature is left behind.
@@ -1705,6 +1751,12 @@ def import_asset(context, zwo_path, options=None):
     elif not geo.meshes:
         report["warnings"].append(
             "%s contains no meshes" % os.path.basename(geo_path))
+    if geo_path and fallback_root and \
+            os.path.normcase(os.path.abspath(geo_path)).startswith(
+                os.path.normcase(os.path.abspath(fallback_root))):
+        report["warnings"].append(
+            "%s comes from the fallback data folder (%s)"
+            % (os.path.basename(geo_path), fallback_root))
 
     collection = bpy.data.collections.new(os.path.basename(base))
     context.scene.collection.children.link(collection)

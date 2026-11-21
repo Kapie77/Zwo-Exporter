@@ -259,6 +259,9 @@ def export_asset(objects, zwo_path, geo_path=None, options=None):
     geo = None
     if os.path.isfile(geo_path):
         geo = GeoFile.load(geo_path)
+    elif any(obj.get("zwo_mesh_index") is not None for obj in objects):
+        report["warnings"].append(
+            "no .geo next to the .zwo; geometry edits were not written")
 
     touched_nodes, seen_nodes = _update_node_transforms(zwo, objects, report)
     for obj in objects:

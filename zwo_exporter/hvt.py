@@ -369,11 +369,13 @@ def parse_hvt(data, endian=None, source=None):
     return tex
 
 
-def texture_path_for_asset(asset_path, asset_root):
+def texture_path_for_asset(asset_path, asset_root, fallback_root=None):
     """Map a `.geo` texture reference to a `.hvt` file on disk.
 
     Material properties store bare names (``facade_diff``), so the bare name is
-    looked up in a per-root index of every ``.hvt`` in the asset tree.
+    looked up in a per-root index of every ``.hvt`` in the asset tree.  When the
+    asset tree is a scene-only rip (``.zwo`` files without their payload), the
+    same relative path is retried under ``fallback_root``.
     """
     if not asset_path:
         return None
@@ -385,12 +387,20 @@ def texture_path_for_asset(asset_path, asset_root):
     else:
         candidates.append(cleaned + ".hvt")
         stem = cleaned
-    for rel in candidates:
-        if asset_root:
-            direct = os.path.join(asset_root, *rel.split("/"))
+    for root in (asset_root, fallback_root):
+        if not root:
+            continue
+        for rel in candidates:
+            direct = os.path.join(root, *rel.split("/"))
             if os.path.isfile(direct):
                 return direct
-    return resolve_texture(stem, asset_root)
+    for root in (asset_root, fallback_root):
+        if not root:
+            continue
+        found = resolve_texture(stem, root)
+        if found:
+            return found
+    return None
 
 
 _TEXTURE_INDEX = {}
