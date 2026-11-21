@@ -1546,6 +1546,7 @@ def import_animation(context, ani_path, armature=None, options=None):
         if armature.animation_data is None:
             armature.animation_data_create()
         armature.animation_data.action = armature_action
+        curves, groups = _action_curves(armature_action, armature)
         actions.append(armature_action)
 
         for bone_name, (locations, rotations, scales) in motion.items():
@@ -1554,10 +1555,10 @@ def import_animation(context, ani_path, armature=None, options=None):
                 pose_bone.rotation_mode = "QUATERNION"
 
             base = 'pose.bones["%s"].%%s' % bone_name.replace('"', '\\"')
-            _write_curves(armature_action, base, locations, rotations, scales,
+            _write_curves(curves, groups, base, locations, rotations, scales,
                           frames, bone_name)
 
-    # -- object-level curves, one action per object (4.2 actions are not shared
+    # -- object-level curves, one action per object (actions are not shared
     # between different ID types).
     for obj, chain in object_targets:
         locations, rotations, scales = [], [], []
@@ -1581,8 +1582,9 @@ def import_animation(context, ani_path, armature=None, options=None):
             obj.animation_data_create()
         obj.animation_data.action = action
         obj.rotation_mode = "QUATERNION"
-        _write_curves(action, "%s", locations, rotations, scales, frames,
-                      obj.name)
+        curves, groups = _action_curves(action, obj)
+        _write_curves(curves, groups, "%s", locations, rotations, scales,
+                      frames, obj.name)
         action.use_frame_range = True
         action.frame_start = frames[0]
         action.frame_end = frames[-1]
@@ -1607,8 +1609,32 @@ def import_animation(context, ani_path, armature=None, options=None):
     return report
 
 
-def _write_curves(action, base, locations, rotations, scales, frames, group):
+def _action_curves(action, owner):
+    """Return ``(fcurves, groups)`` for ``action`` bound to ``owner``.
+
+    Blender 4.4 introduced slotted actions and 5.0 removed the legacy
+    ``Action.fcurves`` shortcut.  There the curves live in a channelbag that
+    belongs to a slot, and the owner has to be pointed at that slot explicitly;
+    an action assigned while still empty never gets an automatic slot, which is
+    why the slot is created here rather than left to Blender.
+    """
+    if not hasattr(action, "slots"):
+        return action.fcurves, None
+    slot = action.slots.new(id_type=owner.id_type, name=owner.name)
+    layer = action.layers.new("Layer")
+    strip = layer.strips.new(type="KEYFRAME")
+    bag = strip.channelbag(slot, ensure=True)
+    if owner.animation_data is None:
+        owner.animation_data_create()
+    owner.animation_data.action = action
+    owner.animation_data.action_slot = slot
+    return bag.fcurves, bag.groups
+
+
+def _write_curves(curves, groups, base, locations, rotations, scales, frames,
+                  group):
     """Write location/rotation/scale curves at the shared frame list."""
+    params = set(curves.bl_rna.functions["new"].parameters.keys())
     # Keep quaternion signs continuous so component-wise interpolation never
     # takes the long way around.
     for index in range(1, len(rotations)):
@@ -1621,8 +1647,17 @@ def _write_curves(action, base, locations, rotations, scales, frames, group):
                          ("scale", scales)):
         width = len(values[0])
         for index in range(width):
-            curve = action.fcurves.new(base % prop, index=index,
-                                       action_group=group)
+            path = base % prop
+            if "group_name" in params:
+                curve = curves.new(path, index=index, group_name=group)
+            elif "action_group" in params:
+                curve = curves.new(path, index=index, action_group=group)
+            else:
+                # Blender 4.4/4.5 channelbags take no group argument; the
+                # group is created on the bag and assigned afterwards.
+                curve = curves.new(path, index=index)
+                if groups is not None:
+                    curve.group = groups.get(group) or groups.new(name=group)
             curve.keyframe_points.add(len(frames))
             for slot, (frame, vector) in enumerate(zip(frames, values)):
                 point = curve.keyframe_points[slot]

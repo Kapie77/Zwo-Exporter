@@ -1,6 +1,6 @@
 # Zwo Exporter (Final Exam)
 
-A Blender 4.2 add-on for **Final Exam** (PC / Steam, PS3 and Xbox 360) scene
+A Blender add-on for **Final Exam** (PC / Steam, PS3 and Xbox 360) scene
 assets. It imports and exports the game's `.zwo` scene graphs together with
 their sibling `.geo` geometry, `.hvt` textures and `.ani` animations.
 
@@ -16,6 +16,33 @@ data (see [PS3 build](#ps3-build) and [Xbox 360 build](#xbox-360-build)).
 | Game                     |   PC   | Xbox 360 | PS3    |
 |--------------------------|:------:|:------:|:-------:|
 | Final Exam               |   ✅   |   ✅   |   ✅   |
+
+## Blender compatibility
+
+The add-on requires **Blender 4.0 or newer** (`bl_info["blender"] = (4, 0, 0)`)
+and is tested headless on every minor series up to 5.3:
+
+| Series | Tested build | PC | PS3 | Xbox 360 |
+|--------|--------------|:--:|:---:|:--------:|
+| 4.0    | 4.0.2        | ✅ | ✅  | ✅       |
+| 4.1    | 4.1.1        | ✅ | ✅  | ✅       |
+| 4.2    | 4.2.23 (LTS) | ✅ | ✅  | ✅       |
+| 4.3    | 4.3.2        | ✅ | ✅  | ✅       |
+| 4.4    | 4.4.3        | ✅ | ✅  | ✅       |
+| 4.5    | 4.5.16 (LTS) | ✅ | ✅  | ✅       |
+| 5.0    | 5.0.1        | ✅ | ✅  | ✅       |
+| 5.1    | 5.1.2        | ✅ | ✅  | ✅       |
+| 5.2    | 5.2.4        | ✅ | ✅  | ✅       |
+| 5.3    | 5.3.0        | ✅ | ✅  | ✅       |
+
+Each build was verified with the same suite: import of a PC map, a PC/PS3/Xbox
+360 character with textures, a byte-identical no-op re-export, animation import
+(including evaluation of the posed armature) and 32-bit texture equality.
+
+Blender 5.0 removed the legacy `Action.fcurves` API. Animation import detects the
+slotted-action API and writes the curves through an action slot, so the same
+`.ani` files produce the same actions and the same evaluated poses in every
+supported version.
 
 ## Quick Guide
 
@@ -326,8 +353,12 @@ green scene lighting, not from a bright texture.
    Blender add-ons directory:
 
    ```
-   %APPDATA%\Blender Foundation\Blender\4.2\scripts\addons\Zwo Exporter
+   %APPDATA%\Blender Foundation\Blender\<version>\scripts\addons\Zwo Exporter
    ```
+
+   (e.g. `4.2`, `4.5` or `5.3`). In Blender 4.2+ the legacy add-on is still
+   installed through **Edit → Preferences → Add-ons → Install…**; the
+   *Extensions* tab only lists extensions that ship a `blender_manifest.toml`.
 
    or zip **the whole main folder** and use
    **Edit → Preferences → Add-ons → Install…**. The ZIP must contain:

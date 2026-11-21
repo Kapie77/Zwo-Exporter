@@ -1,11 +1,11 @@
 bl_info = {
     "name": "Zwo Exporter (Final Exam)",
     "author": "Kaplan",
-    "version": (1, 0, 16),
-    "blender": (4, 2, 0),
+    "version": (1, 0, 17),
+    "blender": (4, 0, 0),
     "location": "File > Import-Export > Final Exam ZWO",
     "description": "Import and export Final Exam (.zwo / .geo / .hvt / .ani) assets",
-    "warning": "PC build only; compressed .ani tracks (UCTK/VCTK) are not decoded",
+    "warning": "Compressed .ani tracks (UCTK/VCTK) are not decoded",
     "doc_url": "",
     "category": "Import-Export",
 }
