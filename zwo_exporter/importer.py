@@ -1514,6 +1514,15 @@ def import_animation(context, ani_path, armature=None, options=None):
     samples = sorted(times)
     frames = [(time - start) / 1000.0 * fps for time in samples]
 
+    # Keys are milliseconds; the action is stored at ``fps`` frames per second.
+    # The scene rate is matched so playback and FBX export keep the timing.
+    if options.get("set_fps", True):
+        scene = context.scene
+        current = scene.render.fps / scene.render.fps_base
+        if abs(current - fps) > 1e-6:
+            scene.render.fps = int(round(fps))
+            scene.render.fps_base = scene.render.fps / fps
+
     report = {"bones": 0, "objects": 0, "tracks": 0, "start": start,
               "end": max(times), "actions": []}
 
@@ -1581,6 +1590,10 @@ def import_animation(context, ani_path, armature=None, options=None):
     if motion:
         armature_action = bpy.data.actions.new(stem)
         armature_action.use_fake_user = True
+        armature_action["zwo_ani"] = os.path.abspath(ani_path)
+        armature_action["zwo_fps"] = fps
+        if zwo_path:
+            armature_action["zwo_asset"] = os.path.abspath(zwo_path)
         if armature.animation_data is None:
             armature.animation_data_create()
         armature.animation_data.action = armature_action
@@ -1616,6 +1629,10 @@ def import_animation(context, ani_path, armature=None, options=None):
 
         action = bpy.data.actions.new("%s_%s" % (stem, obj.name))
         action.use_fake_user = True
+        action["zwo_ani"] = os.path.abspath(ani_path)
+        action["zwo_fps"] = fps
+        if zwo_path:
+            action["zwo_asset"] = os.path.abspath(zwo_path)
         if obj.animation_data is None:
             obj.animation_data_create()
         obj.animation_data.action = action

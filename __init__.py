@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Zwo Exporter (Final Exam)",
     "author": "Kaplan",
-    "version": (1, 0, 18),
+    "version": (1, 0, 19),
     "blender": (4, 0, 0),
     "location": "File > Import-Export > Final Exam ZWO",
     "description": "Import and export Final Exam (.zwo / .geo / .hvt / .ani) assets",
@@ -13,11 +13,12 @@ bl_info = {
 import os
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 
 from .zwo_exporter.importer import import_asset, import_animation
 from .zwo_exporter.exporter import export_asset, objects_for_export
+from .fbx_export import export_animations
 
 PACKAGE = __package__
 
@@ -99,6 +100,10 @@ class ZWO_OT_import_animation(bpy.types.Operator, ImportHelper):
     scene_range: BoolProperty(
         name="Set scene range", default=True,
         description="Match the scene frame range to the imported action")
+    set_fps: BoolProperty(
+        name="Set scene frame rate", default=True,
+        description=("Match the scene frame rate to the imported action so "
+                     "playback and FBX export keep the original timing"))
 
     def execute(self, context):
         path = bpy.path.ensure_ext(self.filepath, ".ani")
@@ -109,6 +114,7 @@ class ZWO_OT_import_animation(bpy.types.Operator, ImportHelper):
             "fps": self.fps,
             "start_at_zero": self.start_at_zero,
             "scene_range": self.scene_range,
+            "set_fps": self.set_fps,
         }
         try:
             report = import_animation(context, path, options=options)
@@ -192,6 +198,53 @@ class ZWO_OT_export_all(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class ZWO_OT_export_fbx(bpy.types.Operator, ExportHelper):
+    """Export the imported .ani actions as FBX animation takes"""
+
+    bl_idname = "export_scene.fexam_zwo_fbx"
+    bl_label = "Export ZWO Animations (FBX)"
+    bl_options = {"REGISTER"}
+
+    filename_ext = ".fbx"
+    filter_glob: StringProperty(default="*.fbx", options={"HIDDEN"})
+
+    mode: EnumProperty(
+        name="Files",
+        items=(
+            ("SINGLE", "One file, all actions",
+             "Write every action as a separate take of a single FBX"),
+            ("PER_ACTION", "One file per action",
+             "Write <name>_<action>.fbx next to the chosen path"),
+        ),
+        default="SINGLE")
+    include_meshes: BoolProperty(
+        name="Include meshes", default=True,
+        description=("Export the skinned meshes and skeleton together with the "
+                     "animations, so Unreal imports a complete character"))
+    scale: FloatProperty(
+        name="Scale", default=1.0, min=0.001, soft_max=100.0,
+        description="FBX global scale; Unreal converts the units on import")
+
+    def execute(self, context):
+        path = os.path.abspath(bpy.path.ensure_ext(self.filepath, ".fbx"))
+        options = {
+            "mode": self.mode,
+            "include_meshes": self.include_meshes,
+            "scale": self.scale,
+        }
+        try:
+            report = export_animations(context, path, options)
+        except Exception as exc:                      # noqa: BLE001
+            self.report({"ERROR"}, "FBX export failed: %s" % exc)
+            return {"CANCELLED"}
+        files = ", ".join(os.path.basename(name) for name in report["files"][:4])
+        if len(report["files"]) > 4:
+            files += ", ..."
+        self.report({"INFO"}, "Exported %d actions to %s"
+                    % (len(report["actions"]), files))
+        return {"FINISHED"}
+
+
 # ------------------------------------------------------------------ panels
 class ZWO_PT_panel(bpy.types.Panel):
     bl_label = "Final Exam ZWO"
@@ -209,6 +262,8 @@ class ZWO_PT_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Animation", icon="ARMATURE_DATA")
         box.operator("import_scene.fexam_zwo_anim", text="Import .ani", icon="IMPORT")
+        box.operator("export_scene.fexam_zwo_fbx", text="Export animations (.fbx)",
+                     icon="EXPORT")
         animated = _active_armature(context)
         if animated is None:
             candidate = context.active_object
@@ -277,6 +332,8 @@ def _menu_import(self, context):
 
 def _menu_export(self, context):
     self.layout.operator("export_scene.fexam_zwo", text="Final Exam (.zwo)")
+    self.layout.operator("export_scene.fexam_zwo_fbx",
+                         text="Final Exam animations (.fbx)")
 
 
 CLASSES = (
@@ -284,6 +341,7 @@ CLASSES = (
     ZWO_OT_import_animation,
     ZWO_OT_export,
     ZWO_OT_export_all,
+    ZWO_OT_export_fbx,
     ZWO_PT_panel,
     ZWO_AddonPreferences,
 )

@@ -65,6 +65,9 @@ supported version.
 * For **animations**, the `.ani` files must also be extracted (they are
   usually located in `...\anims\` or `...\anims\all\`). First import the character's `.zwo` file,
   select the armature, and only then import the `.ani` file.
+* To take the animations to **Unreal Engine** (or Unity, Maya, ...), select the
+  armature and use **Export animations (.fbx)**; see *Export animations (FBX)*
+  below.
 * Keep the `data\common\...` and `data\maps\...` structure intact; do not move
   individual files outside of it.
 
@@ -78,6 +81,7 @@ supported version.
 | `.geo`  | yes | yes | meshes, UVs, normals, skin weights, material table, draw-call material ranges |
 | `.hvt`  | yes | no  | DXT1/DXT3/DXT5 and uncompressed ARGB/XRGB wrapped in a generated DDS |
 | `.ani`  | yes | no  | skeletal and object animation (import only) |
+| `.fbx`  | no  | yes | actions imported from `.ani` as FBX takes (Unreal Engine, Unity, Maya) |
 
 * Imports all mesh data as Blender meshes, groups them in one collection per
   asset, and rebuilds lights and (optionally) cameras.
@@ -424,6 +428,9 @@ Options:
 * **Start at frame 0** – shift the first key to frame 0 (clips often start at a
   non-zero time such as 4733 ms).
 * **Set scene range** – match the scene frame range to the imported action.
+* **Set scene frame rate** – match the scene frame rate to the clip (30 fps
+  native). Without this the clip would play at the wrong speed in a scene set to
+  24 fps, and FBX export would carry the wrong duration.
 
 The imported clip becomes an action on the armature; each animated non-skinned
 object (camera, light, foliage, prop) gets its own action. Re-importing a clip
@@ -439,6 +446,44 @@ loaded in the scene.
   ignored.
 * The exporter has no separate “save as” mode because the scene hierarchy and
   opaque record tails must stay aligned with the original file.
+
+### Export animations (FBX)
+
+Select the **armature** imported from the `.zwo`, then use **Export
+animations (.fbx)** in the *ZWO* panel or **File → Export → Final Exam
+animations (.fbx)**. Every action that animates that armature is written as an
+FBX animation take; Unreal Engine imports each take as one animation sequence.
+
+Options:
+
+* **Files** – *One file, all actions* (recommended: a single FBX containing one
+  take per action) or *One file per action* (`<name>_<action>.fbx`).
+* **Include meshes** – also write the skinned meshes and the skeleton, so the
+  FBX imports into Unreal as a complete character. Turn it off for
+  animation-only files that target an existing skeleton.
+* **Scale** – FBX global scale (default `1.0`). Blender units are metres and
+  Unreal converts them on import, so leave it at `1.0` unless your pipeline
+  expects centimetres.
+
+Notes:
+
+* Only the armature's actions are exported; object-level tracks (doors,
+  cameras, foliage, props) are not part of the FBX.
+* Actions imported from a `.ani` are tagged with their source `.zwo`. When the
+  scene contains several characters, only the actions belonging to the selected
+  armature's asset are written.
+* The animation is baked with one key per frame and every bone keyed, at the
+  frame rate stored on the action when the `.ani` was imported (30 fps native).
+  That is what Unreal's retargeting and compression expect, and it keeps the
+  original duration even if the scene rate was changed afterwards.
+* The skeleton takes the Blender armature name (`zwo_armature` by default).
+  Rename the armature object before exporting if you want a different skeleton
+  name in Unreal.
+* FBX is the safest interchange for Unreal Engine (and Unity, Maya, 3ds Max).
+  glTF also works in UE5, but FBX remains the standard for skeletal meshes and
+  animations.
+* Writing `.ani` back is not supported: the game's animation blocks are not
+  re-serialised, and compressed `UCTK`/`VCTK` tracks are not even decoded.
 
 ## Animation details
 
@@ -529,7 +574,9 @@ Tested against the shipped PS3 data:
   draw calls still agree with each other).
 * Unknown record tails and opaque nodes are preserved verbatim; they are never
   decoded into editable properties.
-* Animation import only; there is no animation export or `.ani` writer.
+* There is no `.ani` writer. Animations go out as FBX
+  ([Export animations (FBX)](#export-animations-fbx)); the game's animation
+  blocks are not re-serialised.
 * Extra animation-only hashes (bones that exist in an `.ani` but not in the
   `.zwo`) are skipped; their tracks are reported as unresolved.
 
@@ -538,6 +585,7 @@ Tested against the shipped PS3 data:
 ```
 Zwo Exporter/
 ├─ __init__.py            add-on entry point, operators, panel, menus
+├─ fbx_export.py          actions -> FBX takes (Unreal Engine, Unity, Maya)
 ├─ README.md
 ├─ LICENSE.txt
 └─ zwo_exporter/
