@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Zwo Exporter (Final Exam)",
     "author": "Kaplan",
-    "version": (1, 0, 19),
+    "version": (1, 0, 22),
     "blender": (4, 0, 0),
     "location": "File > Import-Export > Final Exam ZWO",
     "description": "Import and export Final Exam (.zwo / .geo / .hvt / .ani) assets",
@@ -17,7 +17,8 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 
 from .zwo_exporter.importer import import_asset, import_animation
-from .zwo_exporter.exporter import export_asset, objects_for_export
+from .zwo_exporter.exporter import (
+    ExportError, export_asset, objects_for_export)
 from .fbx_export import export_animations
 
 PACKAGE = __package__
@@ -129,8 +130,29 @@ class ZWO_OT_import_animation(bpy.types.Operator, ImportHelper):
 
 
 # ------------------------------------------------------------------ export
+def _asset_sources(objects):
+    """Distinct source `.zwo` paths of the imported objects."""
+    sources = []
+    for obj in objects:
+        path = obj.get("zwo_file")
+        if not path:
+            continue
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in sources:
+            sources.append(key)
+    return sources
+
+
+def _resolve_asset(context):
+    """The asset to export when the chosen path is not the imported one."""
+    sources = _asset_sources(context.selected_objects)
+    if not sources:
+        sources = _asset_sources(context.scene.objects)
+    return sources[0] if len(sources) == 1 else None
+
+
 class ZWO_OT_export(bpy.types.Operator, ExportHelper):
-    """Write the edited scene back over a Final Exam .zwo/.geo pair"""
+    """Write back over the imported .zwo/.geo, or save a copy elsewhere"""
 
     bl_idname = "export_scene.fexam_zwo"
     bl_label = "Export ZWO"
@@ -144,27 +166,70 @@ class ZWO_OT_export(bpy.types.Operator, ExportHelper):
         description="Export only selected objects")
     make_backup: BoolProperty(
         name="Keep .bak", default=True,
-        description="Copy the original .zwo/.geo to .bak before overwriting")
+        description="Keep a .bak copy of the .zwo/.geo files being overwritten")
+    copy_textures: BoolProperty(
+        name="Copy textures", default=True,
+        description=("When the file ends up outside the game data tree, copy the "
+                     ".hvt textures it uses next to it so the copy imports with "
+                     "textures"))
 
     def execute(self, context):
         path = os.path.abspath(bpy.path.ensure_ext(self.filepath, ".zwo"))
-        objects = objects_for_export(
-            context.selected_objects if self.use_selection else None, path)
+        candidates = context.selected_objects if self.use_selection else None
+        objects = objects_for_export(candidates, path)
         if not objects:
-            self.report({"ERROR"},
-                        "No imported ZWO objects target %s" % path)
+            # A different path means "save a copy": pick the imported asset
+            # (selection first) and let the exporter copy its pair there.
+            source = _resolve_asset(context)
+            if source is not None:
+                objects = objects_for_export(candidates, source)
+        if not objects:
+            self.report({"ERROR"}, self._missing_message(context, path))
             return {"CANCELLED"}
         try:
-            report = export_asset(objects, path, options={"backup": self.make_backup})
+            report = export_asset(objects, path, options={
+                "backup": self.make_backup,
+                "copy_textures": self.copy_textures,
+                "fallback_root": _fallback_root(context),
+            })
+        except ExportError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         except Exception as exc:                      # noqa: BLE001
             self.report({"ERROR"}, "Export failed: %s" % exc)
             return {"CANCELLED"}
-        self.report({"INFO"}, "Wrote %s (%d objects, %d meshes rebuilt)"
-                    % (", ".join(os.path.basename(f) for f in report["files"]),
-                       report["nodes"], report["meshes"]))
+        written = ", ".join(os.path.basename(f) for f in report["files"])
+        extra = ""
+        if report.get("textures"):
+            extra = ", %d textures copied" % report["textures"]
+        if report.get("save_as"):
+            self.report({"INFO"},
+                        "Saved a copy to %s (%d objects, %d meshes rebuilt%s)"
+                        % (written, report["nodes"], report["meshes"], extra))
+        else:
+            self.report({"INFO"}, "Wrote %s (%d objects, %d meshes rebuilt%s)"
+                        % (written, report["nodes"], report["meshes"], extra))
         for warning in report["warnings"]:
             print("ZWO export warning:", warning)
         return {"FINISHED"}
+
+    def _missing_message(self, context, path):
+        sources = _asset_sources(context.selected_objects)
+        if not sources:
+            sources = _asset_sources(context.scene.objects)
+        if not sources:
+            return "No imported ZWO asset in this scene"
+        if os.path.normcase(path) in sources:
+            return ("Nothing to export: %s has no editable meshes"
+                    % os.path.basename(path))
+        if len(sources) == 1:
+            return ("%s is not the imported asset; select its objects to save a "
+                    "copy, or export over %s" % (path, sources[0]))
+        names = ", ".join(os.path.basename(source) for source in sources[:4])
+        if len(sources) > 4:
+            names += ", ..."
+        return ("%d assets are imported (%s); select the objects of the one to "
+                "export, or pick its original path" % (len(sources), names))
 
 
 class ZWO_OT_export_all(bpy.types.Operator):
@@ -188,8 +253,11 @@ class ZWO_OT_export_all(bpy.types.Operator):
         for path in paths:
             objects = objects_for_export(None, path)
             try:
-                report = export_asset(objects, path,
-                                      options={"backup": self.make_backup})
+                report = export_asset(objects, path, options={
+                    "backup": self.make_backup,
+                    "copy_textures": True,
+                    "fallback_root": _fallback_root(context),
+                })
                 total += report["meshes"]
             except Exception as exc:                  # noqa: BLE001
                 self.report({"WARNING"}, "%s: %s" % (path, exc))
@@ -258,6 +326,7 @@ class ZWO_PT_panel(bpy.types.Panel):
         column = layout.column(align=True)
         column.operator("export_scene.fexam_zwo", text="Export .zwo", icon="EXPORT")
         column.operator("export_scene.fexam_zwo_all", text="Export all imported")
+        column.label(text="Other path saves a copy", icon="INFO")
 
         box = layout.box()
         box.label(text="Animation", icon="ARMATURE_DATA")
@@ -281,6 +350,10 @@ class ZWO_PT_panel(bpy.types.Panel):
             box = layout.box()
             box.label(text="Asset", icon="FILE")
             box.label(text=os.path.basename(obj["zwo_file"]))
+            if not os.path.isfile(obj["zwo_file"]):
+                row = box.row()
+                row.alert = True
+                row.label(text="Source .zwo is missing", icon="ERROR")
             if obj.get("zwo_node_name"):
                 box.label(text="Node: %s" % obj["zwo_node_name"])
             if "zwo_mesh_index" in obj:

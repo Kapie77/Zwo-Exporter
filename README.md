@@ -60,7 +60,12 @@ supported version.
   preferences or in the import dialog — at a complete extraction of the **same
   build**: the importer then finds the missing `.geo` and `.hvt` at the same
   relative path there. Exporting back into the scene-only folder rewrites only
-  the `.zwo` and warns that the geometry was not written.
+  the `.zwo` and warns that the geometry was not written; exporting to a
+  different folder copies the `.geo` found in the fallback folder, producing a
+  complete pair.
+* **Exporting.** Picking the imported path rewrites the original `.zwo`/`.geo`;
+  picking another folder or name saves a patched copy there and leaves the
+  original untouched.
 * For **textures**, the corresponding `.hvt` file must also be extracted.
 * For **animations**, the `.ani` files must also be extracted (they are
   usually located in `...\anims\` or `...\anims\all\`). First import the character's `.zwo` file,
@@ -438,14 +443,31 @@ replaces the previous action on those IDs.
 
 ### Export
 
-**File → Export → Final Exam (.zwo)** writes back over the pair the objects
-were imported from. Use **Export all imported** to update every asset currently
+**File → Export → Final Exam (.zwo)** writes the scene back to the asset the
+objects were imported from. Pick the original `.zwo` path to overwrite it in
+place, or **pick any other folder or name to save a copy**: the source `.zwo`
+and `.geo` are copied there and then patched with your edits, leaving the
+original untouched. Use **Export all imported** to update every asset currently
 loaded in the scene.
 
 * Exports only objects tagged with their source `.zwo`; other objects are
   ignored.
-* The exporter has no separate “save as” mode because the scene hierarchy and
-  opaque record tails must stay aligned with the original file.
+* A copy keeps the scene hierarchy and opaque record tails aligned with the
+  original, so it imports exactly like the source asset.
+* Textures are referenced by name, not by path. **Copy textures** (on by
+  default) writes the `.hvt` files the asset uses next to a copy that lands
+  outside the game data tree, so the copy imports with its textures anywhere.
+  Nothing is copied when the destination tree — or a **Fallback data folder** —
+  already holds them.
+* When several assets are imported, select the objects of the one to export so
+  the add-on knows which pair to copy.
+* The scene always points at the file it was imported from. If that `.zwo` was
+  moved, renamed or deleted, the add-on looks for it again next to the imported
+  `.geo`, in the same folder (any letter case) and, when a **Fallback data
+  folder** is set, at the same relative path there. It only accepts a file that
+  still holds the nodes the scene was built from. When nothing matches it stops
+  with a clear message instead of failing halfway through a write; the panel
+  also flags *Source .zwo is missing*. Import the asset again in that case.
 
 ### Export animations (FBX)
 
@@ -482,6 +504,9 @@ Notes:
 * FBX is the safest interchange for Unreal Engine (and Unity, Maya, 3ds Max).
   glTF also works in UE5, but FBX remains the standard for skeletal meshes and
   animations.
+* Re-importing an FBX into the same Blender scene creates a second armature and,
+  with **Include meshes**, a second copy of the mesh. To check a take, switch the
+  armature's action in the Action editor instead of importing the file again.
 * Writing `.ani` back is not supported: the game's animation blocks are not
   re-serialised, and compressed `UCTK`/`VCTK` tracks are not even decoded.
 
@@ -508,7 +533,7 @@ Not decoded:
   parsed as raw blocks but not applied.
 * `1LFK` single-float tracks are parsed but not mapped to a Blender property
   (their meaning is still unknown; values range from 0 to 1 and π/4).
-* Animation export is not implemented.
+* Writing `.ani` back is not implemented; use the FBX export instead.
 
 ## Export/round-trip guarantees
 
@@ -518,6 +543,8 @@ Tested against the shipped PC data:
 * 39/39 cache archives round-trip.
 * 9,741 meshes, 3,160,928 vertices and 1,979,818 faces parse and rebuild.
 * Untouched imports export byte-identically (no changes are invented).
+* Exporting to another path writes a copy whose `.zwo`/`.geo` are byte-identical
+  to the source when nothing was edited; the original is left untouched.
 
 Tested against the shipped PS3 data:
 

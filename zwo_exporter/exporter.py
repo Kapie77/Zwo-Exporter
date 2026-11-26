@@ -246,14 +246,179 @@ def objects_for_export(objects=None, file_path=None):
     return out
 
 
+class ExportError(RuntimeError):
+    """The scene cannot be written back to the requested file."""
+
+
+#: Material keys the importer turns into image textures.
+_TEXTURE_KEYS = ("diffusetexture", "texture", "blobshadingtexture",
+                 "normaltexture", "speculartexture")
+
+
+def _texture_names(geo):
+    """The `.hvt` names a `.geo`'s materials point at, without repeats."""
+    names = []
+    for material in geo.materials:
+        for key in _TEXTURE_KEYS:
+            value = material.get(key)
+            if isinstance(value, str) and value.strip() and value not in names:
+                names.append(value)
+    return names
+
+
+def _copy_textures(geo, source_root, dest_root, fallback_root, folder, report):
+    """Copy the `.hvt` files an asset needs next to a copy that cannot see them.
+
+    A `.zwo`/`.geo` references textures by bare name, so a copy taken out of the
+    game tree imports without textures.  Only loose destinations are filled in:
+    when the file sits inside a data tree that already holds the textures (or
+    when the fallback folder covers it) nothing is copied.
+    """
+    from .hvt import resolve_texture
+    if os.path.normcase(os.path.abspath(dest_root)) != \
+            os.path.normcase(os.path.abspath(folder)):
+        return
+    copied = 0
+    missing = []
+    for name in _texture_names(geo):
+        if resolve_texture(name, dest_root):
+            continue
+        path = resolve_texture(name, source_root) if source_root else None
+        if not path and fallback_root:
+            path = resolve_texture(name, fallback_root)
+        if not path:
+            missing.append(name)
+            continue
+        target = os.path.join(folder, os.path.basename(path))
+        if os.path.isfile(target):
+            continue
+        shutil.copy2(path, target)
+        copied += 1
+    report["textures"] = copied
+    if missing:
+        report["warnings"].append(
+            "%d texture(s) not found next to the copy: %s%s"
+            % (len(missing), ", ".join(missing[:6]),
+               ", ..." if len(missing) > 6 else ""))
+
+
+def _sibling(path, extension):
+    """Return ``<stem><extension>`` next to ``path`` (case-insensitive)."""
+    base = os.path.splitext(path)[0]
+    direct = base + extension
+    if os.path.isfile(direct):
+        return direct
+    folder = os.path.dirname(path)
+    stem = os.path.splitext(os.path.basename(path))[0].lower()
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    for name in names:
+        name_stem, name_ext = os.path.splitext(name)
+        if name_stem.lower() == stem and name_ext.lower() == extension.lower():
+            return os.path.join(folder, name)
+    return None
+
+
+def _has_exported_nodes(path, objects):
+    """True when ``path`` still holds every node the objects came from."""
+    names = {obj["zwo_node_name"] for obj in objects if obj.get("zwo_node_name")}
+    if not names:
+        return True
+    try:
+        zwo = ZwoFile.load(path)
+    except Exception:                                  # noqa: BLE001
+        return False
+    return names <= {node.name for node in zwo.walk()}
+
+
+def _recover_source(source_zwo, source_geo, fallback_root, objects):
+    """Find the `.zwo` a scene was imported from after it moved on disk.
+
+    Only places the asset is known to have lived in are tried: next to the
+    imported `.geo`, in the folder of the recorded `.zwo` (any letter case) and,
+    for a scene-only rip, the same relative path under the fallback data
+    folder.  A candidate must still contain the nodes the scene was built from,
+    so an unrelated file is never patched by accident.
+    """
+    candidates = []
+    if source_geo:
+        candidates.append(os.path.splitext(source_geo)[0] + ".zwo")
+    if source_zwo:
+        candidates.append(source_zwo)
+        if fallback_root:
+            from .importer import asset_root_for
+            try:
+                relative = os.path.relpath(source_zwo,
+                                           asset_root_for(source_zwo))
+            except ValueError:
+                relative = None
+            if relative and not relative.startswith(".."):
+                candidates.append(os.path.join(fallback_root, relative))
+    for candidate in candidates:
+        found = _sibling(candidate, ".zwo")
+        if found and _has_exported_nodes(found, objects):
+            return found, _sibling(found, ".geo")
+    return None, None
+
+
 def export_asset(objects, zwo_path, geo_path=None, options=None):
-    """Write the edited objects back over ``zwo_path`` (and its `.geo`)."""
+    """Write the edited objects back over ``zwo_path`` (and its `.geo`).
+
+    ``zwo_path`` is normally the file the objects were imported from, which is
+    overwritten in place.  Any other path saves a copy: the source `.zwo` and
+    `.geo` are copied there first and then patched with the scene edits, so the
+    original asset is never touched.
+    """
     options = options or {}
-    report = {"meshes": 0, "nodes": 0, "files": [], "warnings": []}
+    report = {"meshes": 0, "nodes": 0, "files": [], "textures": 0,
+              "warnings": []}
 
     zwo_path = os.path.abspath(zwo_path)
     if geo_path is None:
         geo_path = os.path.splitext(zwo_path)[0] + ".geo"
+    geo_path = os.path.abspath(geo_path)
+
+    source_zwo = None
+    source_geo = None
+    for obj in objects:
+        if source_zwo is None and obj.get("zwo_file"):
+            source_zwo = os.path.abspath(obj["zwo_file"])
+        if source_geo is None and obj.get("geo_file"):
+            source_geo = os.path.abspath(obj["geo_file"])
+
+    # The scene keeps pointing at the file it was imported from.  If that file
+    # was moved, renamed or deleted, look for it again before writing anything.
+    if source_zwo and not os.path.isfile(source_zwo):
+        recovered_zwo, recovered_geo = _recover_source(
+            source_zwo, source_geo, options.get("fallback_root"), objects)
+        if recovered_zwo is None:
+            raise ExportError(
+                "the .zwo this scene was imported from no longer exists: %s. "
+                "Restore that file or import the asset again, then export."
+                % source_zwo)
+        report["warnings"].append(
+            "the imported .zwo was missing; used %s instead" % recovered_zwo)
+        source_zwo, source_geo = recovered_zwo, recovered_geo
+
+    if options.get("backup", True):
+        for path in (zwo_path, geo_path):
+            if os.path.isfile(path) and not os.path.isfile(path + ".bak"):
+                shutil.copy2(path, path + ".bak")
+
+    if source_zwo and os.path.normcase(source_zwo) != os.path.normcase(zwo_path):
+        folder = os.path.dirname(zwo_path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        shutil.copy2(source_zwo, zwo_path)
+        if source_geo and os.path.isfile(source_geo):
+            shutil.copy2(source_geo, geo_path)
+        report["save_as"] = source_zwo
+    elif not os.path.isfile(zwo_path):
+        raise ExportError(
+            "no imported .zwo to read from and %s does not exist; import the "
+            "asset before exporting" % zwo_path)
 
     zwo = ZwoFile.load(zwo_path)
     geo = None
@@ -263,6 +428,16 @@ def export_asset(objects, zwo_path, geo_path=None, options=None):
         report["warnings"].append(
             "no .geo next to the .zwo; geometry edits were not written")
 
+    # A copy taken out of the game tree keeps working only if it can still see
+    # its textures, which are referenced by bare name.
+    if geo is not None and options.get("copy_textures", True):
+        from .importer import asset_root_for
+        folder = os.path.dirname(zwo_path)
+        _copy_textures(geo,
+                       asset_root_for(source_zwo or source_geo or zwo_path),
+                       asset_root_for(zwo_path),
+                       options.get("fallback_root"),
+                       folder, report)
     touched_nodes, seen_nodes = _update_node_transforms(zwo, objects, report)
     for obj in objects:
         if obj.get("zwo_node") is not None and \
@@ -300,11 +475,6 @@ def export_asset(objects, zwo_path, geo_path=None, options=None):
             applied.add(mesh_index)
 
     report["nodes"] = len(touched_nodes)
-
-    if options.get("backup", True):
-        for path in (zwo_path, geo_path):
-            if os.path.isfile(path) and not os.path.isfile(path + ".bak"):
-                shutil.copy2(path, path + ".bak")
 
     if geo is not None:
         geo.save(geo_path)
